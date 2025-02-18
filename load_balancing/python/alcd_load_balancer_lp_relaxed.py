@@ -138,8 +138,8 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
   # lpcfg.tol_sub = args.alcd_tol
   lpcfg.tol_sub = 1e-1
   lpcfg.use_CG = False
-  lpcfg.max_iter = 100
-  lpcfg.inner_max_iter = 100
+  lpcfg.max_iter = 50
+  lpcfg.inner_max_iter = 10
 
   # Initialize ALCD solver
   A, b, c, nb, nf, m, me = primal_args
