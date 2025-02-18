@@ -3,12 +3,13 @@
 import cvxpy as cp
 import numpy as np
 from math import isclose
+from alcd_load_balancer_lp_relaxed import *
 
 class LoadBalancer:
-    verbose = True
+    verbose = False
     min_replication_factor = 1
     epsilonRatio = 20
-    solver = cp.CBC
+    solver = cp.GLPK
 
     def __init__(self):
         self.lastR = []
@@ -18,16 +19,24 @@ class LoadBalancer:
         self.lastNumShards = 0
 
     def balance_load(self, num_shards, num_servers, shard_loads, shard_memory_usages, current_locations,
-                     sample_queries, max_memory, split_factor=None):
+                     sample_queries, max_memory, split_factor=None, relax=False, alcd=False):
         if split_factor is not None:
             # Splitting logic
             return self._balance_load_with_splitting(num_shards, num_servers, shard_loads, 
                                                      shard_memory_usages, current_locations,
                                                      sample_queries, max_memory, split_factor)
-        else:
+        elif not relax:
             return self._balance_load_core(num_shards, num_servers, shard_loads, 
                                            shard_memory_usages, current_locations, 
                                            sample_queries, max_memory)
+        elif not alcd:
+            return self._balance_load_core_lp_relaxation(num_shards, num_servers, shard_loads, 
+                                                         shard_memory_usages, current_locations, 
+                                                         sample_queries, max_memory)
+        else:
+            return self._balance_load_core_lp_relaxation_alcd(num_shards, num_servers, shard_loads, 
+                                                              shard_memory_usages, current_locations, 
+                                                              sample_queries, max_memory)
 
     def _balance_load_with_splitting(self, num_shards, num_servers, shard_loads, shard_memory_usages, 
                                      current_locations, sample_queries, max_memory, split_factor):
@@ -227,6 +236,165 @@ class LoadBalancer:
             self.lastR.append(row_r)
             self.lastX.append(row_x)
 
+        return self.lastR
+
+    def _balance_load_core_lp_relaxation_alcd(self, num_shards, num_servers, shard_loads, shard_memory_usages,
+                                            current_locations, sample_queries, max_memory):
+        rs, xs = balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages, 
+                                   current_locations, sample_queries, max_memory)
+        
+        # Retrieve final results
+        self.lastNumShards = num_shards
+        self.lastNumServers = num_servers
+        self.lastR = []
+        self.lastX = []
+
+        for i in range(num_servers):
+            row_r = [rs[i][j].value for j in range(num_shards)]
+            row_x = [xs[i][j].value for j in range(num_shards)]
+            self.lastR.append(row_r)
+            self.lastX.append(row_x)
+
+        # compute binary-ness of the solution in x
+        def test_binaryness(vars, printstr):
+            np_xvars = np.array(vars)
+            binary_vals = np.isclose(np_xvars, 0, rtol=1e-3) | np.isclose(np_xvars, 1, rtol=1e-3)
+            nonbinary_vals = np.logical_not(binary_vals)
+            num_binary_vals = np.sum(binary_vals)
+            num_nonbinary_vals = np.sum(nonbinary_vals)
+            perc_non_binary = num_nonbinary_vals / (num_servers*num_shards) * 100
+            print(f"{printstr} --> Total: {num_servers * num_shards}, # binary: {num_binary_vals}, # non-binary: {num_nonbinary_vals} ({perc_non_binary:.2f}%), histogram: {np.histogram(np_xvars, bins=10)}")
+        # round X up to 1 if r > 0
+        for i in range(num_servers):
+            for j in range(num_shards):
+                if self.lastR[i][j] > 0:
+                    self.lastX[i][j] = 1
+        # check for memory violations
+        for i in range(num_servers):
+            server_memory_usage = sum([self.lastX[i][j] * shard_memory_usages[j] for j in range(num_shards)])
+            if server_memory_usage > max_memory:
+                print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
+        test_binaryness(self.lastR, "R")
+        test_binaryness(self.lastX, "X")
+        return self.lastR
+    
+    def _balance_load_core_lp_relaxation(self, num_shards, num_servers, shard_loads, shard_memory_usages,
+                                         current_locations, sample_queries, max_memory):
+        # Parallel objective
+        solver1_m = None
+        sample_query_keys = [k for k in sample_queries.keys() if len(k) > 1]
+        sample_query_keys = sorted(sample_query_keys, key=lambda k: sample_queries[k], reverse=True)
+        max_query_samples = 500
+        sample_query_keys = sample_query_keys[:max_query_samples]
+        num_sample_queries = len(sample_query_keys)
+
+        # LP relaxation for x_vars
+        r_vars = []
+        x_vars = []
+        for _ in range(num_servers):
+            r_vars.append([cp.Variable(nonneg=True) for __ in range(num_shards)])
+            x_vars.append([cp.Variable(nonneg=True) for __ in range(num_shards)])
+
+        # We approximate the "m" array
+        m_vars = [cp.Variable(boolean=True) for _ in range(num_sample_queries)]
+        query_weights = [sample_queries[k] for k in sample_query_keys]
+
+        constraints = []
+        # Link parallel obj constraints
+        for server_num in range(num_servers):
+            for q_idx, shard_set in enumerate(sample_query_keys):
+                # sum x for shards in shard_set <= m[q_idx]
+                expr = cp.sum([x_vars[server_num][s] for s in shard_set])
+                constraints.append(expr <= m_vars[q_idx])
+
+        # Objective: minimize sum(m * queryWeights)
+        parallel_obj = cp.Minimize(sum([m_vars[i] * query_weights[i] for i in range(num_sample_queries)]))
+
+        # Core constraints
+        constraints += self._set_core_constraints(r_vars, x_vars, num_shards, num_servers,
+                                                shard_loads, shard_memory_usages, max_memory)
+
+        # Solve
+        if num_sample_queries > 0:
+            prob1 = cp.Problem(parallel_obj, constraints)
+            prob1.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
+            solver1_m = [var.value for var in m_vars]
+        else:
+            solver1_m = [20]*len(m_vars)
+
+        # Transfer objective
+        # Redefine r_vars, x_vars
+        r_vars2 = []
+        x_vars2 = []
+        for _ in range(num_servers):
+            r_vars2.append([cp.Variable(nonneg=True) for __ in range(num_shards)])
+            x_vars2.append([cp.Variable(nonneg=True) for __ in range(num_shards)])
+
+        # Transfer cost
+        transfer_costs = np.copy(current_locations)
+        # compute cost as 1 if not present, 0 otherwise
+        for i in range(len(transfer_costs)):
+            for j in range(len(transfer_costs[i])):
+                transfer_costs[i][j] = 1 if transfer_costs[i][j] == 0 else 0
+
+        transfer_cost_list = [sum([x_vars2[i][j] * transfer_costs[i][j] for j in range(num_shards)]) for i in range(num_servers)]
+        norm_lambda = 1e3
+        xvars_arr = []
+        for i in range(num_servers):
+            xvars_arr += x_vars2[i]
+        # transfer_obj = cp.Minimize(cp.sum(transfer_cost_list) + norm_lambda * cp.norm(cp.vstack(xvars_arr), p=2))
+        transfer_obj = cp.Minimize(cp.sum(transfer_cost_list))
+
+        constraints2 = []
+        # link constraints to m
+        q_idx = 0
+        for shard_set in sample_query_keys:
+            for server_num in range(num_servers):
+                expr = sum([x_vars2[server_num][s] for s in shard_set])
+                constraints2.append(expr <= solver1_m[q_idx])
+            q_idx += 1
+
+        constraints2 += self._set_core_constraints(r_vars2, x_vars2, num_shards, num_servers, 
+                                                   shard_loads, shard_memory_usages, max_memory)
+
+        prob2 = cp.Problem(transfer_obj, constraints2)
+        # prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'scipy_options': {'method': 'highs-ipm', 'disp': True, 'tol': 1e-5}})
+        prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
+        print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value}")
+
+        # Retrieve final results
+        self.lastNumShards = num_shards
+        self.lastNumServers = num_servers
+        self.lastR = []
+        self.lastX = []
+
+        for i in range(num_servers):
+            row_r = [r_vars2[i][j].value for j in range(num_shards)]
+            row_x = [x_vars2[i][j].value for j in range(num_shards)]
+            self.lastR.append(row_r)
+            self.lastX.append(row_x)
+
+        # compute binary-ness of the solution in x
+        def test_binaryness(vars, printstr):
+            np_xvars = np.array(vars)
+            binary_vals = np.isclose(np_xvars, 0, rtol=1e-3) | np.isclose(np_xvars, 1, rtol=1e-3)
+            nonbinary_vals = np.logical_not(binary_vals)
+            num_binary_vals = np.sum(binary_vals)
+            num_nonbinary_vals = np.sum(nonbinary_vals)
+            perc_non_binary = num_nonbinary_vals / (num_servers*num_shards) * 100
+            print(f"{printstr} --> Total: {num_servers * num_shards}, # binary: {num_binary_vals}, # non-binary: {num_nonbinary_vals} ({perc_non_binary:.2f}%), histogram: {np.histogram(np_xvars, bins=10)}")
+        # round X up to 1 if r > 0
+        for i in range(num_servers):
+            for j in range(num_shards):
+                if self.lastR[i][j] > 0:
+                    self.lastX[i][j] = 1
+        # check for memory violations
+        for i in range(num_servers):
+            server_memory_usage = sum([self.lastX[i][j] * shard_memory_usages[j] for j in range(num_shards)])
+            if server_memory_usage > max_memory:
+                print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
+        test_binaryness(self.lastR, "R")
+        test_binaryness(self.lastX, "X")
         return self.lastR
 
     def _set_core_constraints(self, r_vars, x_vars, num_shards, num_servers,
