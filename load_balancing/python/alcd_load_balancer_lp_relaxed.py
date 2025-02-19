@@ -30,7 +30,7 @@ class ALCDWrapper:
     self.current_locations = current_locations
     self.avg_load = sum(shard_loads) * 1.0 / num_servers
     self.epsilon_factor = 20
-    self.constraint_scale = 50
+    self.constraint_scale = 1
   
   def __decompress(self):
     # 1. Create cost vector
@@ -45,21 +45,21 @@ class ALCDWrapper:
     # 2. Create constraint matrix
     mi = 2 * self.num_servers + self.num_servers + self.num_vars + self.num_shards
     me = self.num_shards
-    Amat = lps.Matrix(mi + me + 1)
-    bvec = np.zeros(mi + me + 1)
+    Amat = lps.Matrix(mi + me)
+    bvec = np.zeros(mi + me)
     row_offset = 0
     ### Load constraints [on r values] --> Inequality
-    min_load, max_load = - self.avg_load/self.epsilon_factor, self.avg_load/self.epsilon_factor
+    max_load_diff = self.avg_load / self.epsilon_factor
     for i in range(self.num_servers):
       nzidxs = [i * self.num_shards + j for j in range(self.num_shards)]
       nzvals = [x - self.avg_load for x in self.shard_loads]
       nzvals2 = [-x for x in nzvals]
       # load on server i <= avg_load + epsilon
       Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
-      bvec[row_offset] = max_load
+      bvec[row_offset] = max_load_diff
       # load on server i >= avg_load - epsilon
       Amat.setrow(row_offset + 1, list(zip(nzidxs, nzvals2)))
-      bvec[row_offset + 1] = -min_load
+      bvec[row_offset + 1] = max_load_diff
       row_offset += 2
     ### Memory constraints [on x values] --> Inequality
     for i in range(self.num_servers):
@@ -79,7 +79,7 @@ class ALCDWrapper:
         row_offset += 1
     ### Replication factor constraints --> Inequality
     for j in range(self.num_shards):
-      nzidxs = [i * self.num_shards + j for i in range(self.num_servers)]
+      nzidxs = [self.num_vars + i * self.num_shards + j for i in range(self.num_servers)]
       nzvals = [-1 * self.constraint_scale] * self.num_servers
       Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
       bvec[row_offset] = -1 * self.constraint_scale * self.replication_factor
@@ -138,11 +138,13 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
   # lpcfg.tol_sub = args.alcd_tol
   lpcfg.tol_sub = 1e-1
   lpcfg.use_CG = False
-  lpcfg.max_iter = 50
-  lpcfg.inner_max_iter = 10
+  lpcfg.max_iter = 100
+  lpcfg.inner_max_iter = 2
 
   # Initialize ALCD solver
   A, b, c, nb, nf, m, me = primal_args
+  A.printrows()
+  print(b)
   At = dual_lpargs[0]
   x0 = np.zeros(len(c))
   w0 = np.ones(len(b))
@@ -157,9 +159,10 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     hjj_ubound = np.zeros(m + me)
     lps.init_state(w0, x0, h2jj, hjj_ubound, m, me, nb, nf, At, c, b, lpcfg.eta)
   init_end_time = time.time()
+  print(f"h2jj: {list(zip(*np.histogram(h2jj, bins=10)))}")
 
   # Solve via ALCD solver
-  x0[:] = 0
+  x0[:] = 1
   w0[:] = 1
     
   # Solve using ALCD
