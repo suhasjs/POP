@@ -22,6 +22,7 @@ class LBRunner:
         parser.add_argument("--numServers", type=int, required=True, help="Number of servers")
         parser.add_argument("--numSplits", type=int, default=1, help="Split factor for POP")
         parser.add_argument("--numRounds", type=int, default=5, help="Number of rounds to run")
+        parser.add_argument("--randomSeed", type=int, default=0, help="Random seed")
         parser.add_argument("--benchmark", type=str, required=True, help="Which benchmark to run ", choices=["base", "base-lp-relaxed", "base-lp-relaxed-alcd", "split", "heuristic"])
         args = parser.parse_args()
 
@@ -29,6 +30,7 @@ class LBRunner:
         LBRunner.num_servers = args.numServers
         LBRunner.split_factor = args.numSplits
         LBRunner.num_rounds = args.numRounds
+        LBRunner.random_seed = args.randomSeed
         benchmark = args.benchmark
 
         if benchmark == "base":

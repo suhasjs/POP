@@ -250,8 +250,8 @@ class LoadBalancer:
         self.lastX = []
 
         for i in range(num_servers):
-            row_r = [rs[i][j].value for j in range(num_shards)]
-            row_x = [xs[i][j].value for j in range(num_shards)]
+            row_r = [rs[i][j] for j in range(num_shards)]
+            row_x = [xs[i][j] for j in range(num_shards)]
             self.lastR.append(row_r)
             self.lastX.append(row_x)
 
@@ -358,6 +358,7 @@ class LoadBalancer:
                                                    shard_loads, shard_memory_usages, max_memory)
 
         prob2 = cp.Problem(transfer_obj, constraints2)
+        print(f"Problem: {prob2}")
         # prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'scipy_options': {'method': 'highs-ipm', 'disp': True, 'tol': 1e-5}})
         prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
         print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value}")

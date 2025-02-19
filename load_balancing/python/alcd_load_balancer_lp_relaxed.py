@@ -14,6 +14,7 @@ class ALCDWrapper:
   shard_sizes = None
   current_locations = None
   replication_factor = 1
+  only_inequalities = False
 
   # ALCD format variables
   primalA, primalb, primalc = None, None, None
@@ -22,17 +23,18 @@ class ALCDWrapper:
   nb, nf, m, me = 0, 0, 0, 0
   decompressed = False
 
-  def __init__(self, shard_loads, shard_sizes, current_locations, num_servers, max_memory):
+  def __init__(self, shard_loads, shard_sizes, current_locations, num_servers, max_memory, only_inequalities):
     self.num_servers = num_servers
     self.num_shards = len(shard_loads)
     self.num_vars = self.num_servers * self.num_shards
     self.shard_loads = shard_loads
     self.shard_sizes = shard_sizes
     self.max_memory = max_memory
+    self.only_inequalities = only_inequalities
     self.current_locations = current_locations
     self.avg_load = sum(shard_loads) * 1.0 / num_servers
     self.epsilon_factor = 20
-    self.constraint_scale = 1
+    self.constraint_scale = 10
     self.Acoo = None
   
   def __decompress(self):
@@ -47,10 +49,12 @@ class ALCDWrapper:
 
     # 2. Create constraint matrix
     coo_data, coo_row, coo_col = [], [], []
-    # mi = 2 * self.num_servers + self.num_servers + self.num_vars + self.num_shards
-    mi = 2 * self.num_servers + self.num_servers + self.num_vars + self.num_shards + 2 * self.num_shards
-    # me = self.num_shards
-    me = 0
+    if self.only_inequalities:
+      mi = 2 * self.num_servers + self.num_servers + self.num_vars + self.num_shards + 2 * self.num_shards
+      me = 0
+    else:
+      mi = 2 * self.num_servers + self.num_servers + self.num_vars + self.num_shards
+      me = self.num_shards
     Amat = lps.Matrix(mi + me)
     bvec = np.zeros(mi + me)
     row_offset = 0
@@ -58,14 +62,18 @@ class ALCDWrapper:
     max_load_diff = self.avg_load / self.epsilon_factor
     for i in range(self.num_servers):
       nzidxs = [i * self.num_shards + j for j in range(self.num_shards)]
-      nzvals = [x - self.avg_load for x in self.shard_loads]
+      # nzvals = [x - self.avg_load for x in self.shard_loads]
+      # nzvals2 = [-x for x in nzvals]
+      nzvals = [x for x in self.shard_loads]
       nzvals2 = [-x for x in nzvals]
       # load on server i <= avg_load + epsilon
       Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
-      bvec[row_offset] = max_load_diff
+      # bvec[row_offset] = max_load_diff
+      bvec[row_offset] = self.avg_load + max_load_diff
       # load on server i >= avg_load - epsilon
       Amat.setrow(row_offset + 1, list(zip(nzidxs, nzvals2)))
-      bvec[row_offset + 1] = max_load_diff
+      # bvec[row_offset + 1] = max_load_diff
+      bvec[row_offset + 1] = -self.avg_load + max_load_diff
       row_offset += 2
       coo_data.extend(nzvals)
       coo_row.extend([row_offset - 2] * self.num_shards)
@@ -106,30 +114,36 @@ class ALCDWrapper:
       coo_col.extend(nzidxs)
       bvec[row_offset] = -1 * self.constraint_scale * self.replication_factor
       row_offset += 1
-    # ### Sum (r) = 1 --> Equality
-    # for j in range(self.num_shards):
-    #   nzidxs = [i * self.num_shards + j for i in range(self.num_servers)]
-    #   nzvals = [self.constraint_scale] * self.num_servers
-    #   Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
-    #   bvec[row_offset] = self.constraint_scale
-    #   row_offset += 1
-    ### Sum (r) = 1 --> 2xEquality
-    for j in range(self.num_shards):
-      nzidxs = [i * self.num_shards + j for i in range(self.num_servers)]
-      nzvals = [self.constraint_scale] * self.num_servers
-      nzvals2 = [-x for x in nzvals]
-      Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
-      Amat.setrow(row_offset + 1, list(zip(nzidxs, nzvals2)))
-      coo_data.extend(nzvals)
-      coo_row.extend([row_offset] * self.num_servers)
-      coo_col.extend(nzidxs)
-      coo_data.extend(nzvals2)
-      coo_row.extend([row_offset + 1] * self.num_servers)
-      coo_col.extend(nzidxs)
-      bvec[row_offset] = self.constraint_scale
-      bvec[row_offset + 1] = -self.constraint_scale
-      row_offset += 2
- 
+  
+    if not self.only_inequalities:
+      assert row_offset == mi, f"Row offset mismatch: {row_offset} != {mi}"
+      ### Sum (r) = 1 --> Equality
+      for j in range(self.num_shards):
+        nzidxs = [i * self.num_shards + j for i in range(self.num_servers)]
+        nzvals = [self.constraint_scale] * self.num_servers
+        Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
+        bvec[row_offset] = self.constraint_scale
+        coo_data.extend(nzvals)
+        coo_row.extend([row_offset] * self.num_servers)
+        coo_col.extend(nzidxs)
+        row_offset += 1
+    else:
+      ### Sum (r) = 1 --> 2xEquality
+      for j in range(self.num_shards):
+        nzidxs = [i * self.num_shards + j for i in range(self.num_servers)]
+        nzvals = [self.constraint_scale] * self.num_servers
+        nzvals2 = [-x for x in nzvals]
+        Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
+        Amat.setrow(row_offset + 1, list(zip(nzidxs, nzvals2)))
+        coo_data.extend(nzvals)
+        coo_row.extend([row_offset] * self.num_servers)
+        coo_col.extend(nzidxs)
+        coo_data.extend(nzvals2)
+        coo_row.extend([row_offset + 1] * self.num_servers)
+        coo_col.extend(nzidxs)
+        bvec[row_offset] = self.constraint_scale
+        bvec[row_offset + 1] = -self.constraint_scale
+        row_offset += 2
     assert row_offset == mi + me, f"Row offset mismatch: {row_offset} != {mi + me}"
 
     # 3. Create primal and dual matrices
@@ -160,11 +174,12 @@ class ALCDWrapper:
 
 def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
                                      current_locations, sample_queries, max_memory):
-  solver = "CVXPY"
+  solver = "ALCD"
   # Create ALCDWrapper object
   load_start_t = time.time()
   print(f"Creating ALCD format from inputs")
-  lpobj = ALCDWrapper(shard_loads, shard_memory_usages, current_locations, num_servers, max_memory)
+  only_inequalities = False
+  lpobj = ALCDWrapper(shard_loads, shard_memory_usages, current_locations, num_servers, max_memory, only_inequalities)
   primal_args = lpobj.get_primal_alcd_format()
   dual_lpargs = lpobj.get_dual_alcd_format()
   load_end_t = time.time()
@@ -176,12 +191,12 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     lpcfg.eta = 1
     lpcfg.verbose = True
     lpcfg.tol_trans = 1e-1
-    lpcfg.tol = 1e-2
+    lpcfg.tol = 1e-1
     # lpcfg.tol_sub = args.alcd_tol
     lpcfg.tol_sub = 1e-1
     lpcfg.use_CG = False
-    lpcfg.max_iter = 50
-    lpcfg.inner_max_iter = 2
+    lpcfg.max_iter = 100
+    lpcfg.inner_max_iter = 20
 
     # Initialize ALCD solver
     A, b, c, nb, nf, m, me = primal_args
@@ -220,11 +235,32 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
   else:
     A, b, c, nb, nf, m, me = primal_args
     Acsr = lpobj.Acsr
+    if not only_inequalities:
+      # split Acsr into equalities and inequalities
+      num_ineq, num_eq = m, me
+      Aineq = Acsr[:num_ineq, :]
+      Aeq = Acsr[num_ineq:, :]
+      bineq = b[:num_ineq]
+      beq = b[num_ineq:]
+      print(f"Aineq: {Aineq}")
+      print(f"bineq: {bineq}")
+      print(f"Aeq: {Aeq}")
+      print(f"beq: {beq}")
+    else:
+      print(f"Acsr: {Acsr}")
+      print(f"b: {b}")
+    print(f"c: {c}")
     # solve using cvxpy
+    init_start_time = time.time()
     x0 = cp.Variable(len(c), nonneg=True)
-    constraints = [Acsr @ x0 <= b]
+    if not only_inequalities:
+      # constraints = [Acsr @ x0 <= b]
+      constraints = [Aineq @ x0 <= bineq, Aeq @ x0 == beq]
+    else:
+      constraints = [Acsr @ x0 <= b]
     obj = cp.Minimize(c @ x0)
     prob = cp.Problem(obj, constraints)
+    init_end_time = time.time()
     solve_start_time = time.time()
     prob.solve(solver=cp.GLPK, verbose=True)
     solve_end_time = time.time()
