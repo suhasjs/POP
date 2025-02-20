@@ -14,6 +14,7 @@ class LBRunner:
     num_rounds = 100
     skip_rounds = 20
     random_seed = 42
+    scale_factor = 1e5
 
     @staticmethod
     def main():
@@ -43,6 +44,39 @@ class LBRunner:
             LBRunner.zipfian_benchmark_split()
         elif benchmark == "heuristic":
             LBRunner.zipfian_heuristic_benchmark()
+    
+    @staticmethod
+    def load_generator(previous_loads, zipf_value, scale_factor, other_params):
+        random_gen = other_params['random_gen']
+        new_loads = [0] * LBRunner.num_shards
+        if other_params["original"]:
+            for shard_num in range(LBRunner.num_shards):
+                load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+                new_loads[shard_num] = load_val
+        else:
+            new_loads = [x for x in previous_loads]
+        return new_loads
+    @staticmethod
+    def process_load_distribution(return_r, shard_loads, current_locations):
+        new_locations = copy.deepcopy(current_locations)
+        server_loads = []
+        for server_num, Rs in enumerate(return_r):
+            server_load = 0
+            for i, val in enumerate(Rs):
+                server_load += val * shard_loads[i]
+                new_locations[server_num][i] = 1 if val > 0 else 0
+            server_loads.append(server_load)
+        
+        # compute load imbalance, shards moved
+        server_loads.sort()
+        shards_moved = 0
+        load_imbalance = ((server_loads[-1] / server_loads[0]) - 1) * 100.0
+        for i in range(LBRunner.num_servers):
+            for j in range(LBRunner.num_shards):
+                if new_locations[i][j] == 1 and current_locations[i][j] == 0:
+                    # track movement
+                    shards_moved += 1
+        return new_locations, load_imbalance, shards_moved
 
     @staticmethod
     def zipfian_benchmark():
@@ -63,11 +97,12 @@ class LBRunner:
         r.seed(LBRunner.random_seed)
         for round_num in range(LBRunner.num_rounds):
             zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = [0]*LBRunner.num_shards
+            shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True, "random_gen": r})
+            # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
-            for shard_num in range(LBRunner.num_shards):
-                load_val = int(round(1000000.0 * (1.0 / ((shard_num+1)**zipf_value))))
-                shard_loads[shard_num] = load_val
+            # for shard_num in range(LBRunner.num_shards):
+            #     load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+            #     shard_loads[shard_num] = load_val
             average_load = sum(shard_loads) / float(LBRunner.num_servers)
             print(f"Average load: {average_load:.2f}, target load range: [{average_load*0.9:.2f}, {average_load*1.1:.2f}]")
 
@@ -77,28 +112,29 @@ class LBRunner:
             lb_time = (time.time() - start_time) * 1000.0
             assert len(return_r) == LBRunner.num_servers
 
-            last_locations = copy.deepcopy(current_locations)
+            last_locations = current_locations
+            current_locations, load_imbalance, shards_moved = LBRunner.process_load_distribution(return_r, shard_loads, 
+                                                                                                 last_locations)
+            # shards_moved = 0
+            # server_loads = []
+            # for server_num, Rs in enumerate(return_r):
+            #     server_load = 0
+            #     for i, val in enumerate(Rs):
+            #         server_load += val * shard_loads[i]
+            #         current_locations[server_num][i] = 1 if val > 0 else 0
+            #     server_loads.append(server_load)
 
-            shards_moved = 0
-            server_loads = []
-            for server_num, Rs in enumerate(return_r):
-                server_load = 0
-                for i, val in enumerate(Rs):
-                    server_load += val * shard_loads[i]
-                    current_locations[server_num][i] = 1 if val > 0 else 0
-                server_loads.append(server_load)
-
-                # Quick checks
-                # assert server_load <= average_load * 1.1, f"Server load: {server_load}, Average load: {average_load} --> expected server load <= average load * 1.1"
-                # assert server_load >= average_load * 0.9, f"Server load: {server_load}, Average load: {average_load} --> expected server load >= average load * 0.9"
-            # compute load imbalance
-            server_loads.sort()
-            load_imbalance = ((server_loads[-1] / server_loads[0]) - 1) * 100.0
-            for i in range(LBRunner.num_servers):
-                for j in range(LBRunner.num_shards):
-                    if current_locations[i][j] == 1 and last_locations[i][j] == 0:
-                        # track movement
-                        shards_moved += 1
+            #     # Quick checks
+            #     # assert server_load <= average_load * 1.1, f"Server load: {server_load}, Average load: {average_load} --> expected server load <= average load * 1.1"
+            #     # assert server_load >= average_load * 0.9, f"Server load: {server_load}, Average load: {average_load} --> expected server load >= average load * 0.9"
+            # # compute load imbalance
+            # server_loads.sort()
+            # load_imbalance = ((server_loads[-1] / server_loads[0]) - 1) * 100.0
+            # for i in range(LBRunner.num_servers):
+            #     for j in range(LBRunner.num_shards):
+            #         if current_locations[i][j] == 1 and last_locations[i][j] == 0:
+            #             # track movement
+            #             shards_moved += 1
 
             if round_num > LBRunner.skip_rounds:
                 total_movements += shards_moved
@@ -114,7 +150,6 @@ class LBRunner:
     def zipfian_lprelaxed_benchmark():
         print(f"Running base [LP-relaxation] benchmark with {LBRunner.num_shards} shards x {LBRunner.num_servers} servers")
         lb = LoadBalancer()
-        scale_factor = 1e3
         lb.verbose = False
         current_locations = []
         for server_num in range(LBRunner.num_servers):
@@ -130,11 +165,12 @@ class LBRunner:
         r.seed(LBRunner.random_seed)
         for round_num in range(LBRunner.num_rounds):
             zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = [0]*LBRunner.num_shards
+            shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True, "random_gen": r})
+            # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
-            for shard_num in range(LBRunner.num_shards):
-                load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
-                shard_loads[shard_num] = load_val
+            # for shard_num in range(LBRunner.num_shards):
+            #     load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+            #     shard_loads[shard_num] = load_val
             average_load = sum(shard_loads) / float(LBRunner.num_servers)
             print(f"Average load: {average_load:.2f}, target load range: [{average_load*0.9:.2f}, {average_load*1.1:.2f}]")
 
@@ -144,28 +180,31 @@ class LBRunner:
             lb_time = (time.time() - start_time) * 1000.0
             assert len(return_r) == LBRunner.num_servers
 
-            last_locations = copy.deepcopy(current_locations)
+            
+            last_locations = current_locations
+            current_locations, load_imbalance, shards_moved = LBRunner.process_load_distribution(return_r, shard_loads, 
+                                                                                                 last_locations)
+            # last_locations = copy.deepcopy(current_locations)
+            # shards_moved = 0
+            # server_loads = []
+            # for server_num, Rs in enumerate(return_r):
+            #     server_load = 0
+            #     for i, val in enumerate(Rs):
+            #         server_load += val * shard_loads[i]
+            #         current_locations[server_num][i] = 1 if val > 0 else 0
+            #     server_loads.append(server_load)
 
-            shards_moved = 0
-            server_loads = []
-            for server_num, Rs in enumerate(return_r):
-                server_load = 0
-                for i, val in enumerate(Rs):
-                    server_load += val * shard_loads[i]
-                    current_locations[server_num][i] = 1 if val > 0 else 0
-                server_loads.append(server_load)
-
-                # Quick checks
-                # assert server_load <= average_load * 1.1, f"Server load: {server_load}, Average load: {average_load} --> expected server load <= average load * 1.1"
-                # assert server_load >= average_load * 0.9, f"Server load: {server_load}, Average load: {average_load} --> expected server load >= average load * 0.9"
-            # compute load imbalance
-            server_loads.sort()
-            load_imbalance = ((server_loads[-1] / server_loads[0]) - 1) * 100.0
-            for i in range(LBRunner.num_servers):
-                for j in range(LBRunner.num_shards):
-                    if current_locations[i][j] == 1 and last_locations[i][j] == 0:
-                        # track movement
-                        shards_moved += 1
+            #     # Quick checks
+            #     # assert server_load <= average_load * 1.1, f"Server load: {server_load}, Average load: {average_load} --> expected server load <= average load * 1.1"
+            #     # assert server_load >= average_load * 0.9, f"Server load: {server_load}, Average load: {average_load} --> expected server load >= average load * 0.9"
+            # # compute load imbalance
+            # server_loads.sort()
+            # load_imbalance = ((server_loads[-1] / server_loads[0]) - 1) * 100.0
+            # for i in range(LBRunner.num_servers):
+            #     for j in range(LBRunner.num_shards):
+            #         if current_locations[i][j] == 1 and last_locations[i][j] == 0:
+            #             # track movement
+            #             shards_moved += 1
 
             if round_num > LBRunner.skip_rounds:
                 total_movements += shards_moved
@@ -181,7 +220,6 @@ class LBRunner:
     def zipfian_lprelaxed_alcd_benchmark():
         print(f"Running base [LP-relaxation] [ALCD] benchmark with {LBRunner.num_shards} shards x {LBRunner.num_servers} servers")
         lb = LoadBalancer()
-        scale_factor = 1e5
         lb.verbose = False
         current_locations = []
         for server_num in range(LBRunner.num_servers):
@@ -197,11 +235,12 @@ class LBRunner:
         r.seed(LBRunner.random_seed)
         for round_num in range(LBRunner.num_rounds):
             zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = [0]*LBRunner.num_shards
+            shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True, "random_gen": r})
+            # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
-            for shard_num in range(LBRunner.num_shards):
-                load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
-                shard_loads[shard_num] = load_val
+            # for shard_num in range(LBRunner.num_shards):
+            #     load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+            #     shard_loads[shard_num] = load_val
             average_load = sum(shard_loads) / float(LBRunner.num_servers)
             print(f"Average load: {average_load:.2f}, target load range: [{average_load*0.9:.2f}, {average_load*1.1:.2f}]")
 
@@ -211,28 +250,31 @@ class LBRunner:
             lb_time = (time.time() - start_time) * 1000.0
             assert len(return_r) == LBRunner.num_servers
 
-            last_locations = copy.deepcopy(current_locations)
+            last_locations = current_locations
+            current_locations, load_imbalance, shards_moved = LBRunner.process_load_distribution(return_r, shard_loads, 
+                                                                                                 last_locations)
 
-            shards_moved = 0
-            server_loads = []
-            for server_num, Rs in enumerate(return_r):
-                server_load = 0
-                for i, val in enumerate(Rs):
-                    server_load += val * shard_loads[i]
-                    current_locations[server_num][i] = 1 if val > 0 else 0
-                server_loads.append(server_load)
+            # last_locations = copy.deepcopy(current_locations)
+            # shards_moved = 0
+            # server_loads = []
+            # for server_num, Rs in enumerate(return_r):
+            #     server_load = 0
+            #     for i, val in enumerate(Rs):
+            #         server_load += val * shard_loads[i]
+            #         current_locations[server_num][i] = 1 if val > 0 else 0
+            #     server_loads.append(server_load)
 
-                # Quick checks
-                # assert server_load <= average_load * 1.1, f"Server load: {server_load}, Average load: {average_load} --> expected server load <= average load * 1.1"
-                # assert server_load >= average_load * 0.9, f"Server load: {server_load}, Average load: {average_load} --> expected server load >= average load * 0.9"
-            # compute load imbalance
-            server_loads.sort()
-            load_imbalance = ((server_loads[-1] / server_loads[0]) - 1) * 100.0
-            for i in range(LBRunner.num_servers):
-                for j in range(LBRunner.num_shards):
-                    if current_locations[i][j] == 1 and last_locations[i][j] == 0:
-                        # track movement
-                        shards_moved += 1
+            #     # Quick checks
+            #     # assert server_load <= average_load * 1.1, f"Server load: {server_load}, Average load: {average_load} --> expected server load <= average load * 1.1"
+            #     # assert server_load >= average_load * 0.9, f"Server load: {server_load}, Average load: {average_load} --> expected server load >= average load * 0.9"
+            # # compute load imbalance
+            # server_loads.sort()
+            # load_imbalance = ((server_loads[-1] / server_loads[0]) - 1) * 100.0
+            # for i in range(LBRunner.num_servers):
+            #     for j in range(LBRunner.num_shards):
+            #         if current_locations[i][j] == 1 and last_locations[i][j] == 0:
+            #             # track movement
+            #             shards_moved += 1
 
             if round_num > LBRunner.skip_rounds:
                 total_movements += shards_moved
@@ -258,11 +300,12 @@ class LBRunner:
 
         for round_num in range(LBRunner.num_rounds):
             zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = [0]*LBRunner.num_shards
+            shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True, "random_gen": r})
+            # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
-            for shard_idx in range(LBRunner.num_shards):
-                load_val = int(round(1000000.0 * (1.0 / ((shard_idx+1)**zipf_value))))
-                shard_loads[order[shard_idx]] = load_val
+            # for shard_num in range(LBRunner.num_shards):
+            #     load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+            #     shard_loads[shard_num] = load_val
 
             start_time = time.time()
             return_r = lb.balance_load(LBRunner.num_shards, LBRunner.num_servers,
@@ -270,16 +313,20 @@ class LBRunner:
                                        LBRunner.max_memory, LBRunner.split_factor)
             lb_time = (time.time() - start_time) * 1000.0
             assert len(return_r) == LBRunner.num_servers
+        
+            last_locations = current_locations
+            current_locations, load_imbalance, shards_moved = LBRunner.process_load_distribution(return_r, shard_loads, 
+                                                                                                 last_locations)
 
-            last_locations = copy.deepcopy(current_locations)
-            shards_moved = 0
-            for server_num, Rs in enumerate(return_r):
-                for i, val in enumerate(Rs):
-                    current_locations[server_num][i] = 1 if val > 0 else 0
-            for i in range(LBRunner.num_servers):
-                for j in range(LBRunner.num_shards):
-                    if current_locations[i][j] == 1 and last_locations[i][j] == 0:
-                        shards_moved += 1
+            # last_locations = copy.deepcopy(current_locations)
+            # shards_moved = 0
+            # for server_num, Rs in enumerate(return_r):
+            #     for i, val in enumerate(Rs):
+            #         current_locations[server_num][i] = 1 if val > 0 else 0
+            # for i in range(LBRunner.num_servers):
+            #     for j in range(LBRunner.num_shards):
+            #         if current_locations[i][j] == 1 and last_locations[i][j] == 0:
+            #             shards_moved += 1
 
             if round_num >= LBRunner.skip_rounds:
                 total_movements += shards_moved
@@ -306,12 +353,17 @@ class LBRunner:
         r.seed(LBRunner.random_seed)
         for round_num in range(LBRunner.num_rounds):
             zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = {}
-            total_load = 0
-            for shard_num in range(LBRunner.num_shards):
-                load_val = int(round(1000000.0 * (1.0 / ((shard_num+1)**zipf_value))))
-                shard_loads[shard_num] = load_val
-                total_load += load_val
+            gen_shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True,
+                                                                                              "random_gen": r})
+            total_load = sum(gen_shard_loads)
+            # shard_loads = [0]*LBRunner.num_shards
+            memory_usages = [1]*LBRunner.num_shards
+            # for shard_num in range(LBRunner.num_shards):
+            #     load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+            #     shard_loads[shard_num] = load_val
+
+            zipf_value = 0.25 + r.random() * 0.5
+            shard_loads = {i : gen_shard_loads[i] for i in range(LBRunner.num_shards)}
 
             last_locations = copy.deepcopy(current_locations)
             start_time = time.time()

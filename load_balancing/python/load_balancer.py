@@ -9,7 +9,7 @@ class LoadBalancer:
     verbose = False
     min_replication_factor = 1
     epsilonRatio = 20
-    solver = cp.GLPK
+    solver = cp.CBC
 
     def __init__(self):
         self.lastR = []
@@ -241,7 +241,7 @@ class LoadBalancer:
     def _balance_load_core_lp_relaxation_alcd(self, num_shards, num_servers, shard_loads, shard_memory_usages,
                                             current_locations, sample_queries, max_memory):
         rs, xs = balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages, 
-                                   current_locations, sample_queries, max_memory)
+                                   self.lastR, current_locations, sample_queries, max_memory)
         
         # Retrieve final results
         self.lastNumShards = num_shards
@@ -276,18 +276,20 @@ class LoadBalancer:
         # check for memory violations
         for i in range(num_servers):
             server_memory_usage = sum([self.lastX[i][j] * shard_memory_usages[j] for j in range(num_shards)])
-            if server_memory_usage > max_memory:
+            if server_memory_usage > max_memory and self.verbose:
                 print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
-        test_binaryness(self.lastR, "R")
-        test_binaryness(self.lastX, "X")
+        if self.verbose:
+            test_binaryness(self.lastR, "R")
+            test_binaryness(self.lastX, "X")
         newR = self._fix_memory_violations(self.lastR, shard_loads, shard_memory_usages, max_memory)
         self.lastR = newR
-        test_binaryness(newR, "R")
         # recompute new x
         for i in range(num_servers):
             for j in range(num_shards):
                 self.lastX[i][j] = 1 if newR[i][j] > 0 else 0
-        test_binaryness(self.lastX, "X")
+        if self.verbose:
+            test_binaryness(newR, "R")
+            test_binaryness(self.lastX, "X")
         return self.lastR
     
     def _balance_load_core_lp_relaxation(self, num_shards, num_servers, shard_loads, shard_memory_usages,
@@ -399,23 +401,24 @@ class LoadBalancer:
         # round X up to 1 if r > 0
         for i in range(num_servers):
             for j in range(num_shards):
-                if self.lastR[i][j] > 0:
-                    self.lastX[i][j] = 1
+                self.lastX[i][j] = 1 if self.lastR[i][j] > 0 else 0
         # check for memory violations
         for i in range(num_servers):
             server_memory_usage = sum([self.lastX[i][j] * shard_memory_usages[j] for j in range(num_shards)])
-            if server_memory_usage > max_memory:
+            if server_memory_usage > max_memory and self.verbose:
                 print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
-        test_binaryness(self.lastR, "R")
-        test_binaryness(self.lastX, "X")
+        if self.verbose:
+            test_binaryness(self.lastR, "R")
+            test_binaryness(self.lastX, "X")
         newR = self._fix_memory_violations(self.lastR, shard_loads, shard_memory_usages, max_memory)
         self.lastR = newR
-        test_binaryness(newR, "R")
         # recompute new x
         for i in range(num_servers):
             for j in range(num_shards):
                 self.lastX[i][j] = 1 if newR[i][j] > 0 else 0
-        test_binaryness(self.lastX, "X")
+        if self.verbose:
+            test_binaryness(newR, "R")
+            test_binaryness(self.lastX, "X")
         return self.lastR
 
     def _set_core_constraints(self, r_vars, x_vars, num_shards, num_servers,
@@ -468,7 +471,7 @@ class LoadBalancer:
         violated_servers = sorted(violated_servers, key=lambda i: memory_usages[i], reverse=True)
         # fix memory violations
         for server_id in violated_servers:
-            print(f"Memory violation: {server_id}, allocated: {memory_usages[server_id]} > {max_memory}")
+            # print(f"Memory violation: {server_id}, allocated: {memory_usages[server_id]} > {max_memory}")
             # sort shards assigned to the server by load in increasing order of load
             sorted_shards = sorted(list(range(num_shards)), key=lambda j: rvars[server_id][j]*shard_loads[j])
             for shard_id in sorted_shards:
