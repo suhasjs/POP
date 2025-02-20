@@ -264,17 +264,29 @@ class LoadBalancer:
             num_nonbinary_vals = np.sum(nonbinary_vals)
             perc_non_binary = num_nonbinary_vals / (num_servers*num_shards) * 100
             print(f"{printstr} --> Total: {num_servers * num_shards}, # binary: {num_binary_vals}, # non-binary: {num_nonbinary_vals} ({perc_non_binary:.2f}%), histogram: {np.histogram(np_xvars, bins=10)}")
+        '''
         # round X up to 1 if r > 0
         for i in range(num_servers):
             for j in range(num_shards):
                 if self.lastR[i][j] > 0:
                     self.lastX[i][j] = 1
+                else:
+                    self.lastX[i][j] = 0
+        '''
         # check for memory violations
         for i in range(num_servers):
             server_memory_usage = sum([self.lastX[i][j] * shard_memory_usages[j] for j in range(num_shards)])
             if server_memory_usage > max_memory:
                 print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
         test_binaryness(self.lastR, "R")
+        test_binaryness(self.lastX, "X")
+        newR = self._fix_memory_violations(self.lastR, shard_loads, shard_memory_usages, max_memory)
+        self.lastR = newR
+        test_binaryness(newR, "R")
+        # recompute new x
+        for i in range(num_servers):
+            for j in range(num_shards):
+                self.lastX[i][j] = 1 if newR[i][j] > 0 else 0
         test_binaryness(self.lastX, "X")
         return self.lastR
     
@@ -358,7 +370,7 @@ class LoadBalancer:
                                                    shard_loads, shard_memory_usages, max_memory)
 
         prob2 = cp.Problem(transfer_obj, constraints2)
-        print(f"Problem: {prob2}")
+        # print(f"Problem: {prob2}")
         # prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'scipy_options': {'method': 'highs-ipm', 'disp': True, 'tol': 1e-5}})
         prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
         print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value}")
@@ -395,6 +407,14 @@ class LoadBalancer:
             if server_memory_usage > max_memory:
                 print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
         test_binaryness(self.lastR, "R")
+        test_binaryness(self.lastX, "X")
+        newR = self._fix_memory_violations(self.lastR, shard_loads, shard_memory_usages, max_memory)
+        self.lastR = newR
+        test_binaryness(newR, "R")
+        # recompute new x
+        for i in range(num_servers):
+            for j in range(num_shards):
+                self.lastX[i][j] = 1 if newR[i][j] > 0 else 0
         test_binaryness(self.lastX, "X")
         return self.lastR
 
@@ -434,6 +454,43 @@ class LoadBalancer:
             constraints.append(cp.sum([x_vars[i][j] for i in range(num_servers)]) >= actual_rep_factor)
 
         return constraints
+
+    def _fix_memory_violations(self, rvars, shard_loads, shard_memory_usages, max_memory):
+        num_servers = len(rvars)
+        num_shards = len(rvars[0])
+        # construct x vars, compute memory usage
+        xvars = []
+        memory_usages = [0] * num_servers
+        for i in range(num_servers):
+            xvars.append([1 if rvars[i][j] > 0 else 0 for j in range(num_shards)])
+            memory_usages[i] = sum([xvars[i][j] * shard_memory_usages[j] for j in range(num_shards)])
+        violated_servers = [i for i in range(num_servers) if memory_usages[i] > max_memory]
+        violated_servers = sorted(violated_servers, key=lambda i: memory_usages[i], reverse=True)
+        # fix memory violations
+        for server_id in violated_servers:
+            print(f"Memory violation: {server_id}, allocated: {memory_usages[server_id]} > {max_memory}")
+            # sort shards assigned to the server by load in increasing order of load
+            sorted_shards = sorted(list(range(num_shards)), key=lambda j: rvars[server_id][j]*shard_loads[j])
+            for shard_id in sorted_shards:
+                # check if memory violation is fixed
+                if memory_usages[server_id] <= max_memory:
+                    break
+                # is this shard replicated ? If not then skip
+                num_replicas = sum([xvars[i][shard_id] for i in range(num_servers)])
+                if num_replicas == 1:
+                    continue
+                # remove shard from server
+                removed_load = rvars[server_id][shard_id]
+                rvars[server_id][shard_id] = 0
+                xvars[server_id][shard_id] = 0
+                # redistribute this load onto other replicas
+                for i in range(num_servers):
+                    if xvars[i][shard_id] > 0:
+                        # proportionally redistribute the load
+                        added_load = (rvars[i][shard_id] / (1 - removed_load)) * removed_load
+                        rvars[i][shard_id] += added_load
+                memory_usages[server_id] -= shard_memory_usages[shard_id]
+        return rvars
 
     @staticmethod
     def heuristic_balance(shard_loads, shard_map, servers_list):

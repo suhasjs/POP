@@ -181,7 +181,7 @@ class LBRunner:
     def zipfian_lprelaxed_alcd_benchmark():
         print(f"Running base [LP-relaxation] [ALCD] benchmark with {LBRunner.num_shards} shards x {LBRunner.num_servers} servers")
         lb = LoadBalancer()
-        scale_factor = 1e3
+        scale_factor = 1e5
         lb.verbose = False
         current_locations = []
         for server_num in range(LBRunner.num_servers):

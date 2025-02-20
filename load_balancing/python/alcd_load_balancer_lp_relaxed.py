@@ -64,16 +64,18 @@ class ALCDWrapper:
       nzidxs = [i * self.num_shards + j for j in range(self.num_shards)]
       # nzvals = [x - self.avg_load for x in self.shard_loads]
       # nzvals2 = [-x for x in nzvals]
-      nzvals = [x for x in self.shard_loads]
-      nzvals2 = [-x for x in nzvals]
+      nzvals = [x * self.constraint_scale / self.avg_load for x in self.shard_loads]
+      nzvals2 = [-x  for x in nzvals]
       # load on server i <= avg_load + epsilon
       Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
       # bvec[row_offset] = max_load_diff
-      bvec[row_offset] = self.avg_load + max_load_diff
+      # bvec[row_offset] = self.avg_load + max_load_diff
+      bvec[row_offset] = self.constraint_scale * (1 + 1 / self.epsilon_factor)
       # load on server i >= avg_load - epsilon
       Amat.setrow(row_offset + 1, list(zip(nzidxs, nzvals2)))
       # bvec[row_offset + 1] = max_load_diff
-      bvec[row_offset + 1] = -self.avg_load + max_load_diff
+      # bvec[row_offset + 1] = -self.avg_load + max_load_diff
+      bvec[row_offset + 1] = self.constraint_scale * (-1 + 1/ self.epsilon_factor)
       row_offset += 2
       coo_data.extend(nzvals)
       coo_row.extend([row_offset - 2] * self.num_shards)
@@ -85,10 +87,10 @@ class ALCDWrapper:
     ### Memory constraints [on x values] --> Inequality
     for i in range(self.num_servers):
       nzidxs = [self.num_vars + i * self.num_shards + j for j in range(self.num_shards)]
-      nzvals = self.shard_sizes
+      nzvals = [x * self.constraint_scale / 10 for x in self.shard_sizes]
       # memory on server i <= max_memory
       Amat.setrow(row_offset, list(zip(nzidxs, nzvals)))
-      bvec[row_offset] = self.max_memory
+      bvec[row_offset] = self.max_memory * self.constraint_scale / 10
       coo_data.extend(nzvals)
       coo_row.extend([row_offset] * self.num_shards)
       coo_col.extend(nzidxs)
@@ -171,10 +173,12 @@ class ALCDWrapper:
       self.__decompress()
     ## TODO (suhasjs) --> Check if nb, nf, m, me are correctly returned???
     return (self.dualAt, self.dualb, self.dualc, self.me, self.m, self.nb, self.nf)
-
+  
 def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
                                      current_locations, sample_queries, max_memory):
   solver = "ALCD"
+  want_binary_x = False
+  # solver = "CVXPY"
   # Create ALCDWrapper object
   load_start_t = time.time()
   print(f"Creating ALCD format from inputs")
@@ -183,28 +187,33 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
   primal_args = lpobj.get_primal_alcd_format()
   dual_lpargs = lpobj.get_dual_alcd_format()
   load_end_t = time.time()
+  current_x = np.zeros(num_shards * num_servers)
+  for i in range(num_servers):
+    for j in range(num_shards):
+      current_x[i * num_shards + j] = current_locations[i][j]
 
   if solver == "ALCD":
     # Create args for ALCD solver
     lpcfg = lps.LP_Param()
-    lpcfg.solve_from_dual = False
+    lpcfg.solve_from_dual = True
     lpcfg.eta = 1
     lpcfg.verbose = True
     lpcfg.tol_trans = 1e-1
-    lpcfg.tol = 1e-1
+    lpcfg.tol = 1e-2
     # lpcfg.tol_sub = args.alcd_tol
-    lpcfg.tol_sub = 1e-1
-    lpcfg.use_CG = False
-    lpcfg.max_iter = 100
-    lpcfg.inner_max_iter = 20
+    lpcfg.tol_sub = 1e-3
+    lpcfg.use_CG = True
+    lpcfg.max_iter = 10
+    lpcfg.inner_max_iter = 5
+    lpcfg.penalty_alpha = 0
 
     # Initialize ALCD solver
     A, b, c, nb, nf, m, me = primal_args
     print(f"Primal args: nb={nb}, nf={nf}, m={m}, me={me}")
-    A.printrows()
-    print(b)
+    # A.printrows()
+    # print(b)
     At = dual_lpargs[0]
-    At.printrows()
+    # At.printrows()
     x0 = np.zeros(len(c))
     w0 = np.ones(len(b))
     init_start_time = time.time()
@@ -218,11 +227,12 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
       hjj_ubound = np.zeros(m + me)
       lps.init_state(w0, x0, h2jj, hjj_ubound, m, me, nb, nf, At, c, b, lpcfg.eta)
     init_end_time = time.time()
-    print(f"h2jj: {h2jj}\nhjj_ubound: {hjj_ubound}")
+    # print(f"h2jj: {h2jj}\nhjj_ubound: {hjj_ubound}")
     print(f"h2jj: {list(zip(*np.histogram(h2jj, bins=10)))}")
     print(f"hjj_ubound: {list(zip(*np.histogram(hjj_ubound, bins=10)))}")
     # Solve via ALCD solver
     x0[:] = 1
+    x0[num_shards * num_servers:] = current_x
     w0[:] = 1
       
     # Solve using ALCD
@@ -230,7 +240,20 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     solve_start_time = time.time()
     print(f"Solving using ALCD solver")
     # lps.solve_alcd(A, b, c, x0, w0, h2jj, hjj_ubound, nb, nf, m, me, lpcfg, lpinfo)
-    lps.solve_alcd(A, b, c, x0, w0, h2jj, hjj_ubound, nb, nf, m, me, lpcfg, lpinfo)
+    lps.solve_alcd_corrector(A, b, c, x0, w0, h2jj, hjj_ubound, nb, nf, m, me, lpcfg, lpinfo)
+    if want_binary_x:
+      lpcfg.penalty_alpha = 1e-2
+      count = 1
+      num_bin = np.sum(np.isclose(x0, 0, rtol=1e-3) | np.isclose(x0, 1, rtol=1e-3))
+      while num_bin < 0.99 * len(x0) or count < 10:
+        print(f"Iter: {count}, # Binary vars: {num_bin} ({num_bin/len(x0)*100:.2f}%), penalty_alpha={lpcfg.penalty_alpha}")
+        lpcfg.penalty_alpha *= 2
+        lpcfg.max_iter = 200
+        lpcfg.inner_max_iter = 10
+        lpcfg.verbose = False
+        lps.solve_alcd(A, b, c, x0, w0, h2jj, hjj_ubound, nb, nf, m, me, lpcfg, lpinfo)
+        num_bin = np.sum(np.isclose(x0, 0, rtol=1e-3) | np.isclose(x0, 1, rtol=1e-3))
+        count += 1
     solve_end_time = time.time()
   else:
     A, b, c, nb, nf, m, me = primal_args
@@ -242,14 +265,15 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
       Aeq = Acsr[num_ineq:, :]
       bineq = b[:num_ineq]
       beq = b[num_ineq:]
-      print(f"Aineq: {Aineq}")
-      print(f"bineq: {bineq}")
-      print(f"Aeq: {Aeq}")
-      print(f"beq: {beq}")
+      # print(f"Aineq: {Aineq}")
+      # print(f"bineq: {bineq}")
+      # print(f"Aeq: {Aeq}")
+       #print(f"beq: {beq}")
     else:
-      print(f"Acsr: {Acsr}")
-      print(f"b: {b}")
-    print(f"c: {c}")
+      # print(f"Acsr: {Acsr}")
+      # print(f"b: {b}")
+      pass
+    # print(f"c: {c}")
     # solve using cvxpy
     init_start_time = time.time()
     x0 = cp.Variable(len(c), nonneg=True)
@@ -262,14 +286,19 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     prob = cp.Problem(obj, constraints)
     init_end_time = time.time()
     solve_start_time = time.time()
-    prob.solve(solver=cp.GLPK, verbose=True)
+    prob.solve(solver=cp.CBC, verbose=True)
     solve_end_time = time.time()
-    print(f"CVXPY Solver: Status={prob.status}, Optimal value={prob.value}")
+    print(f"CVXPY Solver: Status={prob.status}, Optimal value={prob.value}, solver info={prob.solver_stats}")
     x0 = x0.value
-
+  Acsr = lpobj.Acsr
+  infeasibilities = np.max(Acsr.dot(x0) - b, 0)
+  print(f"Max infeasibility: {np.max(np.abs(infeasibilities))}")
   # Extract results
   rvars = x0[:num_shards*num_servers].round(3)
   xvars = x0[num_shards*num_servers:].round(3)
+  # find idxs where rvars > 0, but xvars is not
+  idxs = np.where((rvars > 0) & (xvars == 0))[0]
+  print(f"Bad idxs: {idxs}")
   # convert to list
   rvars = rvars.reshape((num_servers, num_shards)).tolist()
   xvars = xvars.reshape((num_servers, num_shards)).tolist()
