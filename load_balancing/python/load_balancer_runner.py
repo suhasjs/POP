@@ -70,6 +70,7 @@ class LBRunner:
     def load_generator(previous_loads, load_scale_factor, other_params):
         random_gen = other_params['random_gen']
         new_loads = [0] * LBRunner.num_shards
+        max_zipf_value = 0.75
         if LBRunner.load_type == "stateless" or len(previous_loads) == 0:
             zipf_value = 0.25 + random_gen.random() * 0.5
             for shard_num in range(LBRunner.num_shards):
@@ -85,6 +86,7 @@ class LBRunner:
             else:
                 current_change = ((random_val - 0.5) * perc_change / 100) * previous_zipf_value
             zipf_value = previous_zipf_value + current_change
+            zipf_value = min(max_zipf_value, zipf_value)
             print(f"Zipf value: {previous_zipf_value:.3f} + {current_change:.3f} --> {zipf_value:.3f}")
             for shard_num in range(LBRunner.num_shards):
                 load_val = int(round(load_scale_factor * (1.0 / ((shard_num+1)**zipf_value))))

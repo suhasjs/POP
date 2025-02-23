@@ -9,7 +9,7 @@ class LoadBalancer:
     verbose = False
     min_replication_factor = 1
     epsilonRatio = 20
-    solver = cp.CBC
+    solver = cp.HIGHS
 
     def __init__(self):
         self.lastR = []
@@ -26,11 +26,11 @@ class LoadBalancer:
                                                      shard_memory_usages, current_locations,
                                                      sample_queries, max_memory, split_factor)
         elif not relax:
-            return self._balance_load_core(num_shards, num_servers, shard_loads, 
-                                           shard_memory_usages, current_locations, 
-                                           sample_queries, max_memory)
+            return self._balance_load_core_array(num_shards, num_servers, shard_loads, 
+                                                 shard_memory_usages, current_locations, 
+                                                 sample_queries, max_memory)
         elif not alcd:
-            return self._balance_load_core_lp_relaxation(num_shards, num_servers, shard_loads, 
+            return self._balance_load_core_lp_relaxation_array(num_shards, num_servers, shard_loads, 
                                                          shard_memory_usages, current_locations, 
                                                          sample_queries, max_memory)
         else:
@@ -235,6 +235,123 @@ class LoadBalancer:
             row_x = [x_vars2[i][j].value for j in range(num_shards)]
             self.lastR.append(row_r)
             self.lastX.append(row_x)
+
+        return self.lastR
+
+    def _balance_load_core_array(self, num_shards, num_servers, shard_loads, shard_memory_usages, 
+                                 current_locations, sample_queries, max_memory):
+        # Just do integer variables with CVXPY style placeholders
+        r_vars = cp.Variable((num_servers, num_shards), nonneg=True)
+        x_vars = cp.Variable((num_servers, num_shards), boolean=True)
+
+        # Transfer cost
+        # compute cost as 1 if shard j not present on server i, 0 otherwise
+        transfer_costs = np.ones((num_servers, num_shards), dtype=np.float64)
+        for i in range(num_servers):
+            for j in range(num_shards):
+                if current_locations[i][j] == 1:
+                    transfer_costs[i, j] = 0
+
+        transfer_obj = cp.Minimize(cp.sum(cp.multiply(x_vars, transfer_costs)))
+        constraints2 = []
+        constraints2 += self._set_core_constraints_array(r_vars, x_vars, num_shards, num_servers, 
+                                                   shard_loads, shard_memory_usages, max_memory)
+
+        prob2 = cp.Problem(transfer_obj, constraints2)
+        prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'mip_heuristic_effort': 1})
+        if prob2.status != cp.OPTIMAL:
+            print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value} --> did not converge")
+            exit(-1)
+        # test solution for feasibility
+        def run_checks():
+            arr_shard_loads = np.array(shard_loads)
+            arr_shard_memory_usages = np.array(shard_memory_usages)
+            avg_load = sum(shard_loads) / num_servers
+            server_loads = (r_vars.value @ arr_shard_loads) / avg_load
+            assert np.all(server_loads >= 1 - 1/LoadBalancer.epsilonRatio - 1e-2), f"Loads: {server_loads}, lower threshold: {1 - 1/LoadBalancer.epsilonRatio}"
+            assert np.all(server_loads <= 1 + 1/LoadBalancer.epsilonRatio + 1e-2), f"Loads: {server_loads}, upper threshold: {1 + 1/LoadBalancer.epsilonRatio}"
+            server_memory_usages = x_vars.value @ arr_shard_memory_usages
+            assert np.all(server_memory_usages <= max_memory + 1e-2), f"Memory usage: {server_memory_usages}, max memory: {max_memory}"
+
+        # Retrieve final results
+        self.lastNumShards = num_shards
+        self.lastNumServers = num_servers
+        self.lastR = r_vars.value.tolist()
+        self.lastX = x_vars.value.tolist()
+
+        return self.lastR
+
+    def _balance_load_core_lp_relaxation_array(self, num_shards, num_servers, shard_loads, shard_memory_usages, 
+                                 current_locations, sample_queries, max_memory):
+        # Just do integer variables with CVXPY style placeholders
+        r_vars = cp.Variable((num_servers, num_shards), nonneg=True)
+        x_vars = cp.Variable((num_servers, num_shards), nonneg=True)
+
+        # Transfer cost
+        # compute cost as 1 if shard j not present on server i, 0 otherwise
+        transfer_costs = np.ones((num_servers, num_shards), dtype=np.float64)
+        for i in range(num_servers):
+            for j in range(num_shards):
+                if current_locations[i][j] == 1:
+                    transfer_costs[i, j] = 0
+
+        transfer_obj = cp.Minimize(cp.sum(cp.multiply(x_vars, transfer_costs)))
+        constraints2 = []
+        constraints2 += self._set_core_constraints_array(r_vars, x_vars, num_shards, num_servers, 
+                                                   shard_loads, shard_memory_usages, max_memory)
+
+        prob2 = cp.Problem(transfer_obj, constraints2)
+        prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'mip_heuristic_effort': 1})
+        if prob2.status != cp.OPTIMAL:
+            print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value} --> did not converge")
+            exit(-1)
+        # test solution for feasibility
+        def run_checks():
+            arr_shard_loads = np.array(shard_loads)
+            arr_shard_memory_usages = np.array(shard_memory_usages)
+            avg_load = sum(shard_loads) / num_servers
+            server_loads = (r_vars.value @ arr_shard_loads) / avg_load
+            assert np.all(server_loads >= 1 - 1/LoadBalancer.epsilonRatio - 1e-2), f"Loads: {server_loads}, lower threshold: {1 - 1/LoadBalancer.epsilonRatio}"
+            assert np.all(server_loads <= 1 + 1/LoadBalancer.epsilonRatio + 1e-2), f"Loads: {server_loads}, upper threshold: {1 + 1/LoadBalancer.epsilonRatio}"
+            server_memory_usages = x_vars.value @ arr_shard_memory_usages
+            assert np.all(server_memory_usages <= max_memory + 1e-2), f"Memory usage: {server_memory_usages}, max memory: {max_memory}"
+
+        # Retrieve final results
+        self.lastNumShards = num_shards
+        self.lastNumServers = num_servers
+        self.lastR = r_vars.value.tolist()
+        self.lastX = x_vars.value.tolist()
+
+        # compute binary-ness of the solution in x
+        def test_binaryness(vars, printstr):
+            np_xvars = np.array(vars)
+            binary_vals = np.isclose(np_xvars, 0, rtol=1e-3) | np.isclose(np_xvars, 1, rtol=1e-3)
+            nonbinary_vals = np.logical_not(binary_vals)
+            num_binary_vals = np.sum(binary_vals)
+            num_nonbinary_vals = np.sum(nonbinary_vals)
+            perc_non_binary = num_nonbinary_vals / (num_servers*num_shards) * 100
+            print(f"{printstr} --> Total: {num_servers * num_shards}, # binary: {num_binary_vals}, # non-binary: {num_nonbinary_vals} ({perc_non_binary:.2f}%), histogram: {np.histogram(np_xvars, bins=10)}")
+        # round X up to 1 if r > 0
+        for i in range(num_servers):
+            for j in range(num_shards):
+                self.lastX[i][j] = 1 if self.lastR[i][j] > 0 else 0
+        # check for memory violations
+        for i in range(num_servers):
+            server_memory_usage = sum([self.lastX[i][j] * shard_memory_usages[j] for j in range(num_shards)])
+            if server_memory_usage > max_memory and self.verbose:
+                print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
+        if self.verbose:
+            test_binaryness(self.lastR, "R")
+            test_binaryness(self.lastX, "X")
+        newR = self._fix_memory_violations(self.lastR, shard_loads, shard_memory_usages, max_memory)
+        self.lastR = newR
+        # recompute new x
+        for i in range(num_servers):
+            for j in range(num_shards):
+                self.lastX[i][j] = 1 if newR[i][j] > 0 else 0
+        if self.verbose:
+            test_binaryness(newR, "R")
+            test_binaryness(self.lastX, "X")
 
         return self.lastR
 
@@ -455,6 +572,39 @@ class LoadBalancer:
         # Replication factor constraint
         for j in range(num_shards):
             constraints.append(cp.sum([x_vars[i][j] for i in range(num_servers)]) >= actual_rep_factor)
+
+        return constraints
+
+    def _set_core_constraints_array(self, r_vars, x_vars, num_shards, num_servers,
+                                    shard_loads, shard_memory_usages, max_memory):
+        constraints = []
+        actual_rep_factor = self.min_replication_factor if self.min_replication_factor < num_servers else num_servers
+        avg_load = sum(shard_loads) / num_servers
+        epsilonRatio = 20.0
+        epsilon = avg_load / epsilonRatio
+        constant = 20
+
+        # Load constraints
+        arr_shard_loads = np.array(shard_loads)
+        arr_load_expr = r_vars @ (arr_shard_loads / avg_load)
+        constraints.append(constant * arr_load_expr <= constant * (1 + (1 / epsilonRatio)))
+        constraints.append(constant * arr_load_expr >= constant * (1 - (1 / epsilonRatio)))
+
+        # Memory constraints
+        arr_shard_memory_usages = np.array(shard_memory_usages)
+        arr_mem_expr = x_vars @ arr_shard_memory_usages
+        constraints.append(arr_mem_expr <= max_memory)
+
+        # Link r <= x, also optional constraint if replicationFactor>1
+        constraints.append(r_vars <= x_vars)
+        if actual_rep_factor > 1:
+            constraints.append(x_vars <= r_vars + 0.9999)
+
+        # Sum of r for each shard = 1
+        constraints.append(constant * cp.sum(r_vars, axis=0) == constant * 1.0)
+
+        # Replication factor constraint
+        constraints.append(constant * cp.sum(x_vars, axis=0) >= constant * actual_rep_factor)
 
         return constraints
 

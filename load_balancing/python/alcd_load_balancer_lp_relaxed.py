@@ -34,7 +34,7 @@ class ALCDWrapper:
     self.current_locations = current_locations
     self.avg_load = sum(shard_loads) * 1.0 / num_servers
     self.epsilon_factor = 20
-    self.constraint_scale = 5
+    self.constraint_scale = 20
     self.Acoo = None
   
   def __decompress(self):
@@ -201,7 +201,7 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     lpcfg.solve_from_dual = False
     # TODO (suhasjs) --> Why does reducing eta help us here??
     lpcfg.eta = 1e-1
-    lpcfg.verbose = True
+    lpcfg.verbose = False
     lpcfg.tol_trans = 5e-2
     lpcfg.tol = 5e-2
     # lpcfg.tol_sub = args.alcd_tol
@@ -209,10 +209,10 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     lpcfg.use_CG = True
     lpcfg.max_iter = 1000
     lpcfg.inner_max_iter = 30
-    lpcfg.primal_max_iter = 50
+    lpcfg.primal_max_iter = 1000
     lpcfg.primal_inner_max_iter = 30
-    lpcfg.dual_max_iter = 20
-    lpcfg.dual_inner_max_iter = 15
+    lpcfg.dual_max_iter = 2
+    lpcfg.dual_inner_max_iter = 5
     lpcfg.corrector_max_iter = 1
     lpcfg.penalty_alpha = 0
 
