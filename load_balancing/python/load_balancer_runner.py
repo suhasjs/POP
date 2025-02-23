@@ -1,10 +1,13 @@
 # Converted from LoadBalancerExecutable.java
 # (suhasjs) --> verified
+from load_balancer import LoadBalancer
+
 import argparse
 import time
 import random
-from load_balancer import LoadBalancer
 import copy
+import numpy as np
+import pickle
 
 class LBRunner:
     num_shards = 0
@@ -15,6 +18,13 @@ class LBRunner:
     skip_rounds = 20
     random_seed = 42
     scale_factor = 1e5
+    load_type = "stateless"
+    percent_change = 30
+    zipf_constant = 0.25
+    zipf_scale = 0.5
+    constant_change = True
+    logfile = None
+    logs = []
 
     @staticmethod
     def main():
@@ -24,7 +34,10 @@ class LBRunner:
         parser.add_argument("--numSplits", type=int, default=1, help="Split factor for POP")
         parser.add_argument("--numRounds", type=int, default=5, help="Number of rounds to run")
         parser.add_argument("--randomSeed", type=int, default=0, help="Random seed")
+        parser.add_argument("--load", type=str, help="Type of load? [stateless, stateful]", choices=["stateless", "stateful"], default="stateless")
+        parser.add_argument("--percentChange", type=int, default=LBRunner.percent_change, help="How much does zipf value change between two rounds (only for stateful load generator)")
         parser.add_argument("--benchmark", type=str, required=True, help="Which benchmark to run ", choices=["base", "base-lp-relaxed", "base-lp-relaxed-alcd", "split", "heuristic"])
+        parser.add_argument("--logfile", type=str, required=False, help="Output run log to a pkl file ", default=None)
         args = parser.parse_args()
 
         LBRunner.num_shards = args.numShards
@@ -32,6 +45,9 @@ class LBRunner:
         LBRunner.split_factor = args.numSplits
         LBRunner.num_rounds = args.numRounds
         LBRunner.random_seed = args.randomSeed
+        LBRunner.load_type = args.load
+        LBRunner.percent_change = args.percentChange
+        LBRunner.logfile = args.logfile
         benchmark = args.benchmark
 
         if benchmark == "base":
@@ -44,18 +60,36 @@ class LBRunner:
             LBRunner.zipfian_benchmark_split()
         elif benchmark == "heuristic":
             LBRunner.zipfian_heuristic_benchmark()
+        
+        if LBRunner.logfile is not None:
+            print(f"Saving logs to {LBRunner.logfile}")
+            with open(LBRunner.logfile, "wb") as f:
+                pickle.dump(LBRunner.logs, f)
     
     @staticmethod
-    def load_generator(previous_loads, zipf_value, scale_factor, other_params):
+    def load_generator(previous_loads, load_scale_factor, other_params):
         random_gen = other_params['random_gen']
         new_loads = [0] * LBRunner.num_shards
-        if other_params["original"]:
+        if LBRunner.load_type == "stateless" or len(previous_loads) == 0:
+            zipf_value = 0.25 + random_gen.random() * 0.5
             for shard_num in range(LBRunner.num_shards):
-                load_val = int(round(scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+                load_val = int(round(load_scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
                 new_loads[shard_num] = load_val
         else:
-            new_loads = [x for x in previous_loads]
-        return new_loads
+            previous_zipf_value = other_params['prev_zipf_value']
+            perc_change = LBRunner.percent_change
+            random_val = random_gen.random()
+            if LBRunner.constant_change:
+                change_val = (perc_change / 100) * previous_zipf_value
+                current_change = change_val if random_val > 0.5 else -change_val
+            else:
+                current_change = ((random_val - 0.5) * perc_change / 100) * previous_zipf_value
+            zipf_value = previous_zipf_value + current_change
+            print(f"Zipf value: {previous_zipf_value:.3f} + {current_change:.3f} --> {zipf_value:.3f}")
+            for shard_num in range(LBRunner.num_shards):
+                load_val = int(round(load_scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+                new_loads[shard_num] = load_val
+        return new_loads, zipf_value
     @staticmethod
     def process_load_distribution(return_r, shard_loads, current_locations):
         new_locations = copy.deepcopy(current_locations)
@@ -69,14 +103,20 @@ class LBRunner:
         
         # compute load imbalance, shards moved
         server_loads.sort()
+        avg_load = sum(shard_loads) / float(LBRunner.num_servers)
         shards_moved = 0
-        load_imbalance = ((server_loads[-1] / server_loads[0]) - 1) * 100.0
+        load_imbalance = ((server_loads[-1] - server_loads[0]) / avg_load) * 100.0
         for i in range(LBRunner.num_servers):
             for j in range(LBRunner.num_shards):
                 if new_locations[i][j] == 1 and current_locations[i][j] == 0:
                     # track movement
                     shards_moved += 1
-        return new_locations, load_imbalance, shards_moved
+        num_replicas = [0]*LBRunner.num_shards
+        for i in range(LBRunner.num_shards):
+            for j in range(LBRunner.num_servers):
+                if current_locations[j][i] == 1:
+                    num_replicas[i] += 1
+        return new_locations, load_imbalance, shards_moved, num_replicas
 
     @staticmethod
     def zipfian_benchmark():
@@ -93,11 +133,14 @@ class LBRunner:
 
         total_time = 0
         total_movements = 0
+        total_imbalance = 0
         r = random.Random()
         r.seed(LBRunner.random_seed)
+        previous_loads = []
+        prev_zipf_value = None
         for round_num in range(LBRunner.num_rounds):
-            zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True, "random_gen": r})
+            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            previous_loads, prev_zipf_value = shard_loads, zipf_value
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
             # for shard_num in range(LBRunner.num_shards):
@@ -113,8 +156,10 @@ class LBRunner:
             assert len(return_r) == LBRunner.num_servers
 
             last_locations = current_locations
-            current_locations, load_imbalance, shards_moved = LBRunner.process_load_distribution(return_r, shard_loads, 
-                                                                                                 last_locations)
+            new_stats = LBRunner.process_load_distribution(return_r, shard_loads, last_locations)
+            current_locations, load_imbalance, shards_moved, num_replicas = new_stats
+            sorted_num_replicas = sorted(num_replicas, reverse=True)
+            print(f"Top # replicas: {sorted_num_replicas[:10]}")
             # shards_moved = 0
             # server_loads = []
             # for server_num, Rs in enumerate(return_r):
@@ -139,12 +184,22 @@ class LBRunner:
             if round_num > LBRunner.skip_rounds:
                 total_movements += shards_moved
                 total_time += lb_time
+                total_imbalance += load_imbalance
+            step_log = {
+                "round" : round_num, "zipf" : zipf_value, "shards_moved" : shards_moved,
+                "load_imbalance" : load_imbalance, "lb_time_ms" : lb_time,
+                "num_shards" : LBRunner.num_shards, "num_servers" : LBRunner.num_servers,
+                "shard_loads" : shard_loads, "new_x" : current_locations, "new_r" : return_r,
+                "num_replicas" : num_replicas
+                }
+            LBRunner.logs.append(step_log)
 
             print(f"Round: {round_num} Zipf: {zipf_value:.3f} Shards Moved: {shards_moved} Imbalance: {load_imbalance:.2f}% LB time: {int(lb_time)}ms")
 
         avg_moves = float(total_movements) / (LBRunner.num_rounds - LBRunner.skip_rounds)
         avg_time = int(total_time / (LBRunner.num_rounds - LBRunner.skip_rounds))
-        print(f"Average movements: {avg_moves:.2f}, Average time: {avg_time}ms")
+        avg_imbalance = float(total_imbalance) / (LBRunner.num_rounds - LBRunner.skip_rounds)
+        print(f"Average movements: {avg_moves:.2f}, Average time: {avg_time}ms, Average imbalance: {avg_imbalance:.2f}%")
 
     @staticmethod
     def zipfian_lprelaxed_benchmark():
@@ -161,11 +216,14 @@ class LBRunner:
 
         total_time = 0
         total_movements = 0
+        total_imbalance = 0
         r = random.Random()
         r.seed(LBRunner.random_seed)
+        previous_loads = []
+        prev_zipf_value = None
         for round_num in range(LBRunner.num_rounds):
-            zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True, "random_gen": r})
+            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            previous_loads, prev_zipf_value = shard_loads, zipf_value
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
             # for shard_num in range(LBRunner.num_shards):
@@ -180,10 +238,11 @@ class LBRunner:
             lb_time = (time.time() - start_time) * 1000.0
             assert len(return_r) == LBRunner.num_servers
 
-            
             last_locations = current_locations
-            current_locations, load_imbalance, shards_moved = LBRunner.process_load_distribution(return_r, shard_loads, 
-                                                                                                 last_locations)
+            new_stats = LBRunner.process_load_distribution(return_r, shard_loads, last_locations)
+            current_locations, load_imbalance, shards_moved, num_replicas = new_stats
+            sorted_num_replicas = sorted(num_replicas, reverse=True)
+            print(f"Top # replicas: {sorted_num_replicas[:10]}")
             # last_locations = copy.deepcopy(current_locations)
             # shards_moved = 0
             # server_loads = []
@@ -209,12 +268,22 @@ class LBRunner:
             if round_num > LBRunner.skip_rounds:
                 total_movements += shards_moved
                 total_time += lb_time
+                total_imbalance += load_imbalance
+            step_log = {
+                "round" : round_num, "zipf" : zipf_value, "shards_moved" : shards_moved,
+                "load_imbalance" : load_imbalance, "lb_time_ms" : lb_time,
+                "num_shards" : LBRunner.num_shards, "num_servers" : LBRunner.num_servers,
+                "shard_loads" : shard_loads, "new_x" : current_locations, "new_r" : return_r,
+                "num_replicas" : num_replicas
+                }
+            LBRunner.logs.append(step_log)
 
             print(f"Round: {round_num} Zipf: {zipf_value:.3f} Shards Moved: {shards_moved} Imbalance: {load_imbalance:.2f}% LB time: {int(lb_time)}ms")
 
         avg_moves = float(total_movements) / (LBRunner.num_rounds - LBRunner.skip_rounds)
         avg_time = int(total_time / (LBRunner.num_rounds - LBRunner.skip_rounds))
-        print(f"Average movements: {avg_moves:.2f}, Average time: {avg_time}ms")
+        avg_imbalance = float(total_imbalance) / (LBRunner.num_rounds - LBRunner.skip_rounds)
+        print(f"Average movements: {avg_moves:.2f}, Average time: {avg_time}ms, Average imbalance: {avg_imbalance:.2f}%")
 
     @staticmethod
     def zipfian_lprelaxed_alcd_benchmark():
@@ -231,11 +300,14 @@ class LBRunner:
 
         total_time = 0
         total_movements = 0
+        total_imbalance = 0
         r = random.Random()
         r.seed(LBRunner.random_seed)
+        previous_loads = []
+        prev_zipf_value = None
         for round_num in range(LBRunner.num_rounds):
-            zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True, "random_gen": r})
+            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            previous_loads, prev_zipf_value = shard_loads, zipf_value
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
             # for shard_num in range(LBRunner.num_shards):
@@ -251,9 +323,10 @@ class LBRunner:
             assert len(return_r) == LBRunner.num_servers
 
             last_locations = current_locations
-            current_locations, load_imbalance, shards_moved = LBRunner.process_load_distribution(return_r, shard_loads, 
-                                                                                                 last_locations)
-
+            new_stats = LBRunner.process_load_distribution(return_r, shard_loads, last_locations)
+            current_locations, load_imbalance, shards_moved, num_replicas = new_stats
+            sorted_num_replicas = sorted(num_replicas, reverse=True)
+            print(f"Top #replicas: {sorted_num_replicas[:10]}")
             # last_locations = copy.deepcopy(current_locations)
             # shards_moved = 0
             # server_loads = []
@@ -279,12 +352,22 @@ class LBRunner:
             if round_num > LBRunner.skip_rounds:
                 total_movements += shards_moved
                 total_time += lb_time
+                total_imbalance += load_imbalance
+            step_log = {
+                "round" : round_num, "zipf" : zipf_value, "shards_moved" : shards_moved,
+                "load_imbalance" : load_imbalance, "lb_time_ms" : lb_time,
+                "num_shards" : LBRunner.num_shards, "num_servers" : LBRunner.num_servers,
+                "shard_loads" : shard_loads, "new_x" : current_locations, "new_r" : return_r,
+                "num_replicas" : num_replicas
+                }
+            LBRunner.logs.append(step_log)
 
             print(f"Round: {round_num} Zipf: {zipf_value:.3f} Shards Moved: {shards_moved} Imbalance: {load_imbalance:.2f}% LB time: {int(lb_time)}ms")
 
         avg_moves = float(total_movements) / (LBRunner.num_rounds - LBRunner.skip_rounds)
         avg_time = int(total_time / (LBRunner.num_rounds - LBRunner.skip_rounds))
-        print(f"Average movements: {avg_moves:.2f}, Average time: {avg_time}ms")
+        avg_imbalance = float(total_imbalance) / (LBRunner.num_rounds - LBRunner.skip_rounds)
+        print(f"Average movements: {avg_moves:.2f}, Average time: {avg_time}ms, Average imbalance: {avg_imbalance:.2f}%")
 
     @staticmethod
     def zipfian_benchmark_split():
@@ -293,14 +376,17 @@ class LBRunner:
         current_locations = [[0]*LBRunner.num_shards for _ in range(LBRunner.num_servers)]
         total_time = 0
         total_movements = 0
+        total_imbalance = 0
         order = list(range(LBRunner.num_shards))
         random.shuffle(order)
         r = random.Random()
         r.seed(LBRunner.random_seed)
+        previous_loads = []
+        prev_zipf_value = None
 
         for round_num in range(LBRunner.num_rounds):
-            zipf_value = 0.25 + r.random() * 0.5
-            shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True, "random_gen": r})
+            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            previous_loads, prev_zipf_value = shard_loads, zipf_value
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
             # for shard_num in range(LBRunner.num_shards):
@@ -315,9 +401,8 @@ class LBRunner:
             assert len(return_r) == LBRunner.num_servers
         
             last_locations = current_locations
-            current_locations, load_imbalance, shards_moved = LBRunner.process_load_distribution(return_r, shard_loads, 
-                                                                                                 last_locations)
-
+            new_stats = LBRunner.process_load_distribution(return_r, shard_loads, last_locations)
+            current_locations, load_imbalance, shards_moved, num_replicas = new_stats
             # last_locations = copy.deepcopy(current_locations)
             # shards_moved = 0
             # for server_num, Rs in enumerate(return_r):
@@ -331,12 +416,21 @@ class LBRunner:
             if round_num >= LBRunner.skip_rounds:
                 total_movements += shards_moved
                 total_time += lb_time
-
-            print(f"Round: {round_num} Zipf: {zipf_value:.3f} Shards Moved: {shards_moved} LB time: {int(lb_time)}ms")
+                total_imbalance += load_imbalance
+            step_log = {
+                "round" : round_num, "zipf" : zipf_value, "shards_moved" : shards_moved,
+                "load_imbalance" : load_imbalance, "lb_time_ms" : lb_time,
+                "num_shards" : LBRunner.num_shards, "num_servers" : LBRunner.num_servers,
+                "shard_loads" : shard_loads, "new_x" : current_locations, "new_r" : return_r,
+                "num_replicas" : num_replicas
+                }
+            LBRunner.logs.append(step_log)
+            print(f"Round: {round_num} Zipf: {zipf_value:.3f} Shards Moved: {shards_moved} Imbalance: {load_imbalance:.2f}% LB time: {int(lb_time)}ms")
 
         avg_moves = float(total_movements) / (LBRunner.num_rounds - LBRunner.skip_rounds)
         avg_time = int(total_time / (LBRunner.num_rounds - LBRunner.skip_rounds))
-        print(f"Split Average movements: {avg_moves:.2f}, Average time: {avg_time}ms")
+        avg_imbalance = float(total_imbalance) / (LBRunner.num_rounds - LBRunner.skip_rounds)
+        print(f"Split Average movements: {avg_moves:.2f}, Average time: {avg_time}ms, Average imbalance: {avg_imbalance:.2f}%")
 
     @staticmethod
     def zipfian_heuristic_benchmark():
@@ -349,12 +443,14 @@ class LBRunner:
 
         total_time = 0
         total_movements = 0
+        total_imbalance = 0
         r = random.Random()
         r.seed(LBRunner.random_seed)
+        previous_loads = []
+        prev_zipf_value = None
         for round_num in range(LBRunner.num_rounds):
-            zipf_value = 0.25 + r.random() * 0.5
-            gen_shard_loads = LBRunner.load_generator([], zipf_value, LBRunner.scale_factor, {"original": True,
-                                                                                              "random_gen": r})
+            gen_shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            previous_loads, prev_zipf_value = gen_shard_loads, zipf_value
             total_load = sum(gen_shard_loads)
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
@@ -371,21 +467,35 @@ class LBRunner:
             lb_time = (time.time() - start_time)*1000.0
             assert len(current_locations) == LBRunner.num_shards
             average_load = total_load / float(LBRunner.num_servers)
+            server_loads = [0]*LBRunner.num_servers
 
             shards_moved = 0
             for sh in range(LBRunner.num_shards):
+                server_loads[current_locations[sh]] += shard_loads[sh]
                 if current_locations[sh] != last_locations[sh]:
                     shards_moved += 1
+            server_loads.sort()
+            load_imbalance = ((server_loads[-1] - server_loads[0]) / average_load) * 100.0
 
             if round_num >= LBRunner.skip_rounds:
                 total_movements += shards_moved
                 total_time += lb_time
+                total_imbalance += load_imbalance
+            step_log = {
+                "round" : round_num, "zipf" : zipf_value, "shards_moved" : shards_moved,
+                "load_imbalance" : load_imbalance, "lb_time_ms" : lb_time,
+                "num_shards" : LBRunner.num_shards, "num_servers" : LBRunner.num_servers,
+                "shard_loads" : shard_loads, "new_x" : current_locations, "new_r" : None,
+                "num_replicas" : [1]*LBRunner.num_shards
+                }
+            LBRunner.logs.append(step_log)
 
-            print(f"Round: {round_num} Zipf: {zipf_value:.3f} Shards Moved: {shards_moved} LB time: {int(lb_time)}ms")
+            print(f"Round: {round_num} Zipf: {zipf_value:.3f} Shards Moved: {shards_moved} LB time: {int(lb_time)}ms, Imbalance: {load_imbalance:.2f}%")
 
         avg_moves = float(total_movements) / (LBRunner.num_rounds - LBRunner.skip_rounds)
         avg_time = int(total_time / (LBRunner.num_rounds - LBRunner.skip_rounds))
-        print(f"Average movements: {avg_moves:.2f}, Average time: {avg_time}ms")
+        avg_imbalance = float(total_imbalance) / (LBRunner.num_rounds - LBRunner.skip_rounds)
+        print(f"Average movements: {avg_moves:.2f}, Average time: {avg_time}ms, Average imbalance: {avg_imbalance:.2f}%")
 
 if __name__ == "__main__":
     LBRunner.main()

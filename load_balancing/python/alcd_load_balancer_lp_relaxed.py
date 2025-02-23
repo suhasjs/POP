@@ -34,7 +34,7 @@ class ALCDWrapper:
     self.current_locations = current_locations
     self.avg_load = sum(shard_loads) * 1.0 / num_servers
     self.epsilon_factor = 20
-    self.constraint_scale = 10
+    self.constraint_scale = 5
     self.Acoo = None
   
   def __decompress(self):
@@ -200,23 +200,25 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     lpcfg = lps.LP_Param()
     lpcfg.solve_from_dual = False
     # TODO (suhasjs) --> Why does reducing eta help us here??
-    lpcfg.eta = 5e-2
-    lpcfg.verbose = False
-    lpcfg.tol_trans = 1e-1
-    lpcfg.tol = 1e-1
+    lpcfg.eta = 1e-1
+    lpcfg.verbose = True
+    lpcfg.tol_trans = 5e-2
+    lpcfg.tol = 5e-2
     # lpcfg.tol_sub = args.alcd_tol
-    lpcfg.tol_sub = 1e-1
+    lpcfg.tol_sub = 1e-2
     lpcfg.use_CG = True
-    lpcfg.max_iter = 50
-    lpcfg.inner_max_iter = 100
-    lpcfg.primal_max_iter = 5
-    lpcfg.primal_inner_max_iter = 20
-    lpcfg.dual_max_iter = 5
-    lpcfg.dual_inner_max_iter = 20
+    lpcfg.max_iter = 1000
+    lpcfg.inner_max_iter = 30
+    lpcfg.primal_max_iter = 50
+    lpcfg.primal_inner_max_iter = 30
+    lpcfg.dual_max_iter = 20
+    lpcfg.dual_inner_max_iter = 15
+    lpcfg.corrector_max_iter = 1
     lpcfg.penalty_alpha = 0
 
     # Initialize ALCD solver
     A, b, c, nb, nf, m, me = primal_args
+    c[num_vars:] += 1
     # A.printrows()
     # print(b)
     At = dual_lpargs[0]
@@ -252,6 +254,7 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     solve_end_time = time.time()
   else:
     A, b, c, nb, nf, m, me = primal_args
+    c[num_vars:] += 0
     Acsr = lpobj.Acsr
     if not only_inequalities:
       # split Acsr into equalities and inequalities
@@ -281,7 +284,7 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     prob = cp.Problem(obj, constraints)
     init_end_time = time.time()
     solve_start_time = time.time()
-    prob.solve(solver=cp.CBC, verbose=False)
+    prob.solve(solver=cp.CBC, verbose=True)
     solve_end_time = time.time()
     # print(f"CVXPY Solver: Status={prob.status}, Optimal value={prob.value}, solver info={prob.solver_stats}")
     x0 = x0.value
