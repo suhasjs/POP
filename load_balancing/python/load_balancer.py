@@ -6,10 +6,12 @@ from math import isclose
 from alcd_load_balancer_lp_relaxed import *
 
 class LoadBalancer:
-    verbose = False
+    verbose = True
     min_replication_factor = 1
     epsilonRatio = 20
     solver = cp.HIGHS
+    warm_start = True
+    cached_problem = {}
 
     def __init__(self):
         self.lastR = []
@@ -135,7 +137,7 @@ class LoadBalancer:
                 local_current_locations.append(row)
 
             # sampleQueries is empty assert:
-            rs = self._balance_load_core(num_split_shards, servers_per_split, local_shard_loads,
+            rs = self._balance_load_core_array(num_split_shards, servers_per_split, local_shard_loads,
                                          local_shard_memory_usages, local_current_locations, 
                                          sample_queries, max_memory)
 
@@ -258,7 +260,10 @@ class LoadBalancer:
                                                    shard_loads, shard_memory_usages, max_memory)
 
         prob2 = cp.Problem(transfer_obj, constraints2)
-        prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'mip_heuristic_effort': 1})
+        prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'mip_heuristic_effort': 1, 
+                                                                                 'threads': 8, 
+                                                                                 'dual_feasibility_tolerance': 5e-2, 
+                                                                                 'primal_feasibility_tolerance': 5e-2})
         if prob2.status != cp.OPTIMAL:
             print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value} --> did not converge")
             exit(-1)
@@ -283,27 +288,43 @@ class LoadBalancer:
 
     def _balance_load_core_lp_relaxation_array(self, num_shards, num_servers, shard_loads, shard_memory_usages, 
                                  current_locations, sample_queries, max_memory):
-        # Just do integer variables with CVXPY style placeholders
-        r_vars = cp.Variable((num_servers, num_shards), nonneg=True)
-        x_vars = cp.Variable((num_servers, num_shards), nonneg=True)
+        # Build the problem first time around (or if warm-start is disabled)
+        if len(self.cached_problem) == 0 or not self.warm_start:
+            # Just do integer variables with CVXPY style placeholders
+            r_vars = cp.Variable((num_servers, num_shards), nonneg=True)
+            x_vars = cp.Variable((num_servers, num_shards), nonneg=True)
+            transfer_costs = cp.Parameter((num_servers, num_shards), nonneg=True)
 
-        # Transfer cost
+            transfer_obj = cp.Minimize(cp.sum(cp.multiply(x_vars, transfer_costs)))
+            constraints = []
+            constraints += self._set_core_constraints_array(r_vars, x_vars, num_shards, num_servers, 
+                                                    shard_loads, shard_memory_usages, max_memory)
+
+            prob = cp.Problem(transfer_obj, constraints)
+            self.cached_problem = {
+                "r_vars": r_vars, "x_vars": x_vars, "transfer_costs": transfer_costs, "prob": prob
+            }
+        r_vars, x_vars, transfer_costs, prob = self.cached_problem["r_vars"], self.cached_problem["x_vars"], self.cached_problem["transfer_costs"], self.cached_problem["prob"]
+
+        # Set transfer cost for this iteration
         # compute cost as 1 if shard j not present on server i, 0 otherwise
-        transfer_costs = np.ones((num_servers, num_shards), dtype=np.float64)
+        cur_transfer_costs = np.ones((num_servers, num_shards), dtype=np.float64)
         for i in range(num_servers):
             for j in range(num_shards):
                 if current_locations[i][j] == 1:
-                    transfer_costs[i, j] = 0
+                    cur_transfer_costs[i, j] = 0
+        transfer_costs.value = cur_transfer_costs
 
-        transfer_obj = cp.Minimize(cp.sum(cp.multiply(x_vars, transfer_costs)))
-        constraints2 = []
-        constraints2 += self._set_core_constraints_array(r_vars, x_vars, num_shards, num_servers, 
-                                                   shard_loads, shard_memory_usages, max_memory)
-
-        prob2 = cp.Problem(transfer_obj, constraints2)
-        prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'mip_heuristic_effort': 1})
-        if prob2.status != cp.OPTIMAL:
-            print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value} --> did not converge")
+        if self.solver == cp.HIGHS:
+            solver_opts = {'mip_heuristic_effort': 1, 'threads': 8, 'dual_feasibility_tolerance': 5e-2, 
+                           'primal_feasibility_tolerance': 5e-2, 'verbose': LoadBalancer.verbose}
+            if self.warm_start and self.cached_problem is not None:
+                solver_opts['warm_start'] = True
+            prob.solve(solver=LoadBalancer.solver, **solver_opts)
+        else:
+            prob.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
+        if prob.status != cp.OPTIMAL:
+            print(f"[LP relaxation] Solver status: {prob.status}, objective: {prob.value} --> did not converge")
             exit(-1)
         # test solution for feasibility
         def run_checks():
