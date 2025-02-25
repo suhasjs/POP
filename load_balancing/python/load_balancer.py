@@ -4,12 +4,13 @@ import cvxpy as cp
 import numpy as np
 from math import isclose
 from alcd_load_balancer_lp_relaxed import *
+import ortools.pdlp.solvers_pb2 as pdlp_pb
 
 class LoadBalancer:
     verbose = True
     min_replication_factor = 1
     epsilonRatio = 20
-    solver = cp.HIGHS
+    solver = cp.PDLP
     warm_start = True
     cached_problem = {}
 
@@ -260,10 +261,13 @@ class LoadBalancer:
                                                    shard_loads, shard_memory_usages, max_memory)
 
         prob2 = cp.Problem(transfer_obj, constraints2)
-        prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'mip_heuristic_effort': 1, 
-                                                                                 'threads': 8, 
-                                                                                 'dual_feasibility_tolerance': 5e-2, 
-                                                                                 'primal_feasibility_tolerance': 5e-2})
+        if LoadBalancer.solver == cp.HIGHS:
+            prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, **{'mip_heuristic_effort': 1, 
+                                                                                    'threads': 8, 
+                                                                                    'dual_feasibility_tolerance': 5e-2, 
+                                                                                    'primal_feasibility_tolerance': 5e-2})
+        else:
+            prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
         if prob2.status != cp.OPTIMAL:
             print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value} --> did not converge")
             exit(-1)
@@ -294,17 +298,20 @@ class LoadBalancer:
             r_vars = cp.Variable((num_servers, num_shards), nonneg=True)
             x_vars = cp.Variable((num_servers, num_shards), nonneg=True)
             transfer_costs = cp.Parameter((num_servers, num_shards), nonneg=True)
+            shard_loads_param = cp.Parameter((num_shards, ), nonneg=True)
 
             transfer_obj = cp.Minimize(cp.sum(cp.multiply(x_vars, transfer_costs)))
             constraints = []
             constraints += self._set_core_constraints_array(r_vars, x_vars, num_shards, num_servers, 
-                                                    shard_loads, shard_memory_usages, max_memory)
+                                                    shard_loads_param, shard_memory_usages, max_memory)
 
             prob = cp.Problem(transfer_obj, constraints)
             self.cached_problem = {
-                "r_vars": r_vars, "x_vars": x_vars, "transfer_costs": transfer_costs, "prob": prob
+                "r_vars": r_vars, "x_vars": x_vars, "transfer_costs": transfer_costs, "prob": prob, "shard_loads_param": shard_loads_param
             }
         r_vars, x_vars, transfer_costs, prob = self.cached_problem["r_vars"], self.cached_problem["x_vars"], self.cached_problem["transfer_costs"], self.cached_problem["prob"]
+        shard_loads_param = self.cached_problem["shard_loads_param"]
+        shard_loads_param.value = np.array(shard_loads)
 
         # Set transfer cost for this iteration
         # compute cost as 1 if shard j not present on server i, 0 otherwise
@@ -314,15 +321,27 @@ class LoadBalancer:
                 if current_locations[i][j] == 1:
                     cur_transfer_costs[i, j] = 0
         transfer_costs.value = cur_transfer_costs
-
-        if self.solver == cp.HIGHS:
+        solver_opts = {}
+        if self.solver == cp.PDLP:
+            params = pdlp_pb.PrimalDualHybridGradientParams()
+            params.termination_criteria.eps_optimal_absolute = 5e-2
+            params.termination_criteria.time_sec_limit = 300
+            params.num_threads = 1
+            solver_opts['parameters_proto'] = params
+            solver_opts['time_sec_limit'] = 300
+        elif self.solver == cp.HIGHS:
             solver_opts = {'mip_heuristic_effort': 1, 'threads': 8, 'dual_feasibility_tolerance': 5e-2, 
-                           'primal_feasibility_tolerance': 5e-2, 'verbose': LoadBalancer.verbose}
+                           'primal_feasibility_tolerance': 5e-2, 'verbose': LoadBalancer.verbose,
+                           'time_limit': 300}
             if self.warm_start and self.cached_problem is not None:
                 solver_opts['warm_start'] = True
-            prob.solve(solver=LoadBalancer.solver, **solver_opts)
+        elif self.solver == cp.SCIP:
+            solver_opts = {'scip_params': {'display/lpinfo' : True}}
         else:
-            prob.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
+            pass
+        prob.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, ignore_dpp=True, **solver_opts, scip_params = {
+            'display/lpinfo' : True
+        })
         if prob.status != cp.OPTIMAL:
             print(f"[LP relaxation] Solver status: {prob.status}, objective: {prob.value} --> did not converge")
             exit(-1)
@@ -361,18 +380,16 @@ class LoadBalancer:
             server_memory_usage = sum([self.lastX[i][j] * shard_memory_usages[j] for j in range(num_shards)])
             if server_memory_usage > max_memory and self.verbose:
                 print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
-        if self.verbose:
-            test_binaryness(self.lastR, "R")
-            test_binaryness(self.lastX, "X")
+        test_binaryness(self.lastR, "R")
+        test_binaryness(self.lastX, "X")
         newR = self._fix_memory_violations(self.lastR, shard_loads, shard_memory_usages, max_memory)
         self.lastR = newR
         # recompute new x
         for i in range(num_servers):
             for j in range(num_shards):
                 self.lastX[i][j] = 1 if newR[i][j] > 0 else 0
-        if self.verbose:
-            test_binaryness(newR, "R")
-            test_binaryness(self.lastX, "X")
+        test_binaryness(newR, "R")
+        test_binaryness(self.lastX, "X")
 
         return self.lastR
 
@@ -416,18 +433,16 @@ class LoadBalancer:
             server_memory_usage = sum([self.lastX[i][j] * shard_memory_usages[j] for j in range(num_shards)])
             if server_memory_usage > max_memory and self.verbose:
                 print(f"Memory violation for server {i}, usage: {server_memory_usage} > {max_memory}")
-        if self.verbose:
-            test_binaryness(self.lastR, "R")
-            test_binaryness(self.lastX, "X")
+        test_binaryness(self.lastR, "R")
+        test_binaryness(self.lastX, "X")
         newR = self._fix_memory_violations(self.lastR, shard_loads, shard_memory_usages, max_memory)
         self.lastR = newR
         # recompute new x
         for i in range(num_servers):
             for j in range(num_shards):
                 self.lastX[i][j] = 1 if newR[i][j] > 0 else 0
-        if self.verbose:
-            test_binaryness(newR, "R")
-            test_binaryness(self.lastX, "X")
+        test_binaryness(newR, "R")
+        test_binaryness(self.lastX, "X")
         return self.lastR
     
     def _balance_load_core_lp_relaxation(self, num_shards, num_servers, shard_loads, shard_memory_usages,
@@ -600,13 +615,14 @@ class LoadBalancer:
                                     shard_loads, shard_memory_usages, max_memory):
         constraints = []
         actual_rep_factor = self.min_replication_factor if self.min_replication_factor < num_servers else num_servers
-        avg_load = sum(shard_loads) / num_servers
+        avg_load = cp.sum(shard_loads) / num_servers
         epsilonRatio = 20.0
         epsilon = avg_load / epsilonRatio
         constant = 20
 
         # Load constraints
-        arr_shard_loads = np.array(shard_loads)
+        # arr_shard_loads = np.array(shard_loads)
+        arr_shard_loads = shard_loads
         arr_load_expr = r_vars @ (arr_shard_loads / avg_load)
         constraints.append(constant * arr_load_expr <= constant * (1 + (1 / epsilonRatio)))
         constraints.append(constant * arr_load_expr >= constant * (1 - (1 / epsilonRatio)))
