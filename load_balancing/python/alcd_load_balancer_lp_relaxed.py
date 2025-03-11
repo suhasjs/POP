@@ -175,7 +175,7 @@ class ALCDWrapper:
     return (self.dualAt, self.dualb, self.dualc, self.me, self.m, self.nb, self.nf)
   
 def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
-                      current_rs, current_xs, sample_queries, max_memory):
+                      current_rs, current_xs, sample_queries, max_memory, state):
   solver = "ALCD"
   warm_start = True
   # solver = "CVXPY"
@@ -201,24 +201,24 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     lpcfg.solve_from_dual = False
     # TODO (suhasjs) --> Why does reducing eta help us here??
     lpcfg.eta = 1e-1
-    lpcfg.verbose = False
+    lpcfg.verbose = True
     lpcfg.tol_trans = 5e-2
     lpcfg.tol = 5e-2
     # lpcfg.tol_sub = args.alcd_tol
     lpcfg.tol_sub = 1e-2
     lpcfg.use_CG = True
     lpcfg.max_iter = 1000
-    lpcfg.inner_max_iter = 30
-    lpcfg.primal_max_iter = 1000
+    lpcfg.inner_max_iter = 15
+    lpcfg.primal_max_iter = 10
     lpcfg.primal_inner_max_iter = 30
-    lpcfg.dual_max_iter = 2
-    lpcfg.dual_inner_max_iter = 5
-    lpcfg.corrector_max_iter = 1
+    lpcfg.dual_max_iter = 10
+    lpcfg.dual_inner_max_iter = 50
+    lpcfg.corrector_max_iter = 10
     lpcfg.penalty_alpha = 0
 
     # Initialize ALCD solver
     A, b, c, nb, nf, m, me = primal_args
-    c[num_vars:] += 1
+    c[num_vars:] += 10
     # A.printrows()
     # print(b)
     At = dual_lpargs[0]
@@ -244,6 +244,8 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     w0[:] = 1
     if warm_start and len(current_rs) > 0:
       x0[:] = warm_start_guess
+      # if 'duals' in state:
+      #   w0[:] = state['duals']
     
     # Solve using ALCD
     lpinfo = lps.LP_Info()
@@ -252,6 +254,8 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     # lps.solve_alcd(A, b, c, x0, w0, h2jj, hjj_ubound, nb, nf, m, me, lpcfg, lpinfo)
     lps.solve_alcd(A, b, c, x0, w0, h2jj, hjj_ubound, nb, nf, m, me, lpcfg, lpinfo)
     solve_end_time = time.time()
+    state['primals'] = x0.copy()
+    state['duals'] = w0.copy()
   else:
     A, b, c, nb, nf, m, me = primal_args
     c[num_vars:] += 0
@@ -301,4 +305,4 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
   rvars = rvars.reshape((num_servers, num_shards)).tolist()
   xvars = xvars.reshape((num_servers, num_shards)).tolist()
   # print(f"ALCD Solver: Load={(load_end_t - load_start_t)*1000:.1f}ms, Init: {(init_end_time - init_start_time)*1000:.1f}ms, Solve time: {(solve_end_time - solve_start_time)*1000:.1f}ms")
-  return rvars, xvars
+  return rvars, xvars, state

@@ -4,15 +4,20 @@ import cvxpy as cp
 import numpy as np
 from math import isclose
 from alcd_load_balancer_lp_relaxed import *
-import ortools.pdlp.solvers_pb2 as pdlp_pb
+try:
+    import ortools.pdlp.solvers_pb2 as pdlp_pb
+except ImportError:
+    print("Could not import ortools, please install it using 'pip install ortools'")
+    pass
 
 class LoadBalancer:
     verbose = True
     min_replication_factor = 1
     epsilonRatio = 20
-    solver = cp.PDLP
+    solver = cp.CPLEX
     warm_start = True
-    cached_problem = {}
+    state = {}
+    iter_num = 0
 
     def __init__(self):
         self.lastR = []
@@ -29,9 +34,15 @@ class LoadBalancer:
                                                      shard_memory_usages, current_locations,
                                                      sample_queries, max_memory, split_factor)
         elif not relax:
-            return self._balance_load_core_array(num_shards, num_servers, shard_loads, 
-                                                 shard_memory_usages, current_locations, 
-                                                 sample_queries, max_memory)
+            self.iter_num += 1
+            if self.iter_num > 20:
+                return self._balance_load_core_array(num_shards, num_servers, shard_loads, 
+                                                    shard_memory_usages, current_locations, 
+                                                    sample_queries, max_memory)
+            else:
+                return self._balance_load_core_lp_relaxation_array(num_shards, num_servers, shard_loads, 
+                                                         shard_memory_usages, current_locations, 
+                                                         sample_queries, max_memory)
         elif not alcd:
             return self._balance_load_core_lp_relaxation_array(num_shards, num_servers, shard_loads, 
                                                          shard_memory_usages, current_locations, 
@@ -245,7 +256,7 @@ class LoadBalancer:
                                  current_locations, sample_queries, max_memory):
         # Just do integer variables with CVXPY style placeholders
         r_vars = cp.Variable((num_servers, num_shards), nonneg=True)
-        x_vars = cp.Variable((num_servers, num_shards), boolean=True)
+        x_vars = cp.Variable((num_servers, num_shards), integer=True)
 
         # Transfer cost
         # compute cost as 1 if shard j not present on server i, 0 otherwise
@@ -254,11 +265,12 @@ class LoadBalancer:
             for j in range(num_shards):
                 if current_locations[i][j] == 1:
                     transfer_costs[i, j] = 0
-
+        transfer_costs += 1
         transfer_obj = cp.Minimize(cp.sum(cp.multiply(x_vars, transfer_costs)))
         constraints2 = []
-        constraints2 += self._set_core_constraints_array(r_vars, x_vars, num_shards, num_servers, 
+        constraints2 += self._set_core_constraints_array_ilp(r_vars, x_vars, num_shards, num_servers, 
                                                    shard_loads, shard_memory_usages, max_memory)
+        constraints2 += [x_vars <= 1]
 
         prob2 = cp.Problem(transfer_obj, constraints2)
         if LoadBalancer.solver == cp.HIGHS:
@@ -266,11 +278,13 @@ class LoadBalancer:
                                                                                     'threads': 8, 
                                                                                     'dual_feasibility_tolerance': 5e-2, 
                                                                                     'primal_feasibility_tolerance': 5e-2})
+        elif LoadBalancer.solver == cp.CPLEX:
+            cplex_params={"mip.tolerances.mipgap": 1, "emphasis.mip": 0, "mip.strategy.search": 2, "preprocessing.presolve": 0, "parallel": -1, "threads": 1, "mip.tolerances.integrality": 5e-2}
+            prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, cplex_params=cplex_params, reoptimize=True)
         else:
             prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
         if prob2.status != cp.OPTIMAL:
             print(f"[LP relaxation] Solver status: {prob2.status}, objective: {prob2.value} --> did not converge")
-            exit(-1)
         # test solution for feasibility
         def run_checks():
             arr_shard_loads = np.array(shard_loads)
@@ -293,25 +307,17 @@ class LoadBalancer:
     def _balance_load_core_lp_relaxation_array(self, num_shards, num_servers, shard_loads, shard_memory_usages, 
                                  current_locations, sample_queries, max_memory):
         # Build the problem first time around (or if warm-start is disabled)
-        if len(self.cached_problem) == 0 or not self.warm_start:
-            # Just do integer variables with CVXPY style placeholders
-            r_vars = cp.Variable((num_servers, num_shards), nonneg=True)
-            x_vars = cp.Variable((num_servers, num_shards), nonneg=True)
-            transfer_costs = cp.Parameter((num_servers, num_shards), nonneg=True)
-            shard_loads_param = cp.Parameter((num_shards, ), nonneg=True)
+        # Just do integer variables with CVXPY style placeholders
+        r_vars = cp.Variable((num_servers, num_shards), nonneg=True)
+        x_vars = cp.Variable((num_servers, num_shards), nonneg=True)
+        transfer_costs = cp.Parameter((num_servers, num_shards), nonneg=True)
 
-            transfer_obj = cp.Minimize(cp.sum(cp.multiply(x_vars, transfer_costs)))
-            constraints = []
-            constraints += self._set_core_constraints_array(r_vars, x_vars, num_shards, num_servers, 
-                                                    shard_loads_param, shard_memory_usages, max_memory)
+        transfer_obj = cp.Minimize(cp.sum(cp.multiply(x_vars, transfer_costs)))
+        constraints = []
+        constraints += self._set_core_constraints_array(r_vars, x_vars, num_shards, num_servers, 
+                                                shard_loads, shard_memory_usages, max_memory)
 
-            prob = cp.Problem(transfer_obj, constraints)
-            self.cached_problem = {
-                "r_vars": r_vars, "x_vars": x_vars, "transfer_costs": transfer_costs, "prob": prob, "shard_loads_param": shard_loads_param
-            }
-        r_vars, x_vars, transfer_costs, prob = self.cached_problem["r_vars"], self.cached_problem["x_vars"], self.cached_problem["transfer_costs"], self.cached_problem["prob"]
-        shard_loads_param = self.cached_problem["shard_loads_param"]
-        shard_loads_param.value = np.array(shard_loads)
+        prob = cp.Problem(transfer_obj, constraints)
 
         # Set transfer cost for this iteration
         # compute cost as 1 if shard j not present on server i, 0 otherwise
@@ -333,15 +339,13 @@ class LoadBalancer:
             solver_opts = {'mip_heuristic_effort': 1, 'threads': 8, 'dual_feasibility_tolerance': 5e-2, 
                            'primal_feasibility_tolerance': 5e-2, 'verbose': LoadBalancer.verbose,
                            'time_limit': 300}
-            if self.warm_start and self.cached_problem is not None:
+            if self.warm_start:
                 solver_opts['warm_start'] = True
         elif self.solver == cp.SCIP:
             solver_opts = {'scip_params': {'display/lpinfo' : True}}
         else:
             pass
-        prob.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, ignore_dpp=True, **solver_opts, scip_params = {
-            'display/lpinfo' : True
-        })
+        prob.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, ignore_dpp=True, **solver_opts)
         if prob.status != cp.OPTIMAL:
             print(f"[LP relaxation] Solver status: {prob.status}, objective: {prob.value} --> did not converge")
             exit(-1)
@@ -395,8 +399,9 @@ class LoadBalancer:
 
     def _balance_load_core_lp_relaxation_alcd(self, num_shards, num_servers, shard_loads, shard_memory_usages,
                                             current_locations, sample_queries, max_memory):
-        rs, xs = balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages, 
-                                   self.lastR, current_locations, sample_queries, max_memory)
+        state = self.state
+        rs, xs, self.state = balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages, 
+                                               self.lastR, current_locations, sample_queries, max_memory, state)
         
         # Retrieve final results
         self.lastNumShards = num_shards
@@ -615,14 +620,14 @@ class LoadBalancer:
                                     shard_loads, shard_memory_usages, max_memory):
         constraints = []
         actual_rep_factor = self.min_replication_factor if self.min_replication_factor < num_servers else num_servers
-        avg_load = cp.sum(shard_loads) / num_servers
+        avg_load = np.sum(shard_loads) / num_servers
         epsilonRatio = 20.0
         epsilon = avg_load / epsilonRatio
         constant = 20
 
         # Load constraints
-        # arr_shard_loads = np.array(shard_loads)
-        arr_shard_loads = shard_loads
+        arr_shard_loads = np.array(shard_loads)
+        # arr_shard_loads = shard_loads
         arr_load_expr = r_vars @ (arr_shard_loads / avg_load)
         constraints.append(constant * arr_load_expr <= constant * (1 + (1 / epsilonRatio)))
         constraints.append(constant * arr_load_expr >= constant * (1 - (1 / epsilonRatio)))
@@ -642,6 +647,41 @@ class LoadBalancer:
 
         # Replication factor constraint
         constraints.append(constant * cp.sum(x_vars, axis=0) >= constant * actual_rep_factor)
+
+        return constraints
+    
+    def _set_core_constraints_array_ilp(self, r_vars, x_vars, num_shards, num_servers,
+                                    shard_loads, shard_memory_usages, max_memory):
+        constraints = []
+        actual_rep_factor = self.min_replication_factor if self.min_replication_factor < num_servers else num_servers
+        avg_load = np.sum(shard_loads) / num_servers
+        epsilonRatio = 20.0
+        epsilon = avg_load / epsilonRatio
+
+        # Load constraints
+        arr_shard_loads = np.array(shard_loads)
+        # arr_shard_loads = shard_loads
+        arr_load_expr = r_vars @ arr_shard_loads
+        max_load = avg_load + epsilon
+        min_load = avg_load - epsilon
+        constraints.append(arr_load_expr <= max_load)
+        constraints.append(arr_load_expr >= min_load)
+
+        # Memory constraints
+        arr_shard_memory_usages = np.array(shard_memory_usages)
+        arr_mem_expr = x_vars @ arr_shard_memory_usages
+        constraints.append(arr_mem_expr <= max_memory)
+
+        # Link r <= x, also optional constraint if replicationFactor>1
+        constraints.append(r_vars <= x_vars)
+        if actual_rep_factor > 1:
+            constraints.append(x_vars <= r_vars + 0.9999)
+
+        # Sum of r for each shard = 1
+        constraints.append(cp.sum(r_vars, axis=0) == 1.0)
+
+        # Replication factor constraint
+        constraints.append(cp.sum(x_vars, axis=0) >= actual_rep_factor)
 
         return constraints
 
