@@ -229,7 +229,8 @@ public class LoadBalancer {
 
         // Begin transfer objective.
         cplex = new IloCplex();
-         cplex.setParam(IloCplex.Param.MIP.Tolerances.MIPGap, 0.05);
+        cplex.setParam(IloCplex.Param.MIP.Tolerances.MIPGap, 0.05);
+        cplex.setParam(IloCplex.Param.Threads, 8);
         if (!verbose) {
             cplex.setOut(null);
         }

@@ -17,11 +17,12 @@ class LBRunner:
     num_rounds = 100
     skip_rounds = 20
     random_seed = 42
-    scale_factor = 1e5
+    scale_factor = 1e6
     load_type = "stateless"
     percent_change = 30
     zipf_constant = 0.25
     zipf_scale = 0.5
+    zipf_values = None
     constant_change = True
     logfile = None
     logs = []
@@ -34,7 +35,8 @@ class LBRunner:
         parser.add_argument("--numSplits", type=int, default=1, help="Split factor for POP")
         parser.add_argument("--numRounds", type=int, default=5, help="Number of rounds to run")
         parser.add_argument("--randomSeed", type=int, default=0, help="Random seed")
-        parser.add_argument("--load", type=str, help="Type of load? [stateless, stateful]", choices=["stateless", "stateful"], default="stateless")
+        parser.add_argument("--zipfTrace", type=str, default=None, help="Trace of zipf values for each round [must point to a file with one zipf value per line]")
+        parser.add_argument("--load", type=str, help="Type of load? [stateless, stateful, trace]", choices=["stateless", "stateful", "trace"], default="stateless")
         parser.add_argument("--percentChange", type=int, default=LBRunner.percent_change, help="How much does zipf value change between two rounds (only for stateful load generator)")
         parser.add_argument("--benchmark", type=str, required=True, help="Which benchmark to run ", choices=["base", "base-lp-relaxed", "base-lp-relaxed-alcd", "split", "heuristic"])
         parser.add_argument("--logfile", type=str, required=False, help="Output run log to a pkl file ", default=None)
@@ -48,6 +50,14 @@ class LBRunner:
         LBRunner.load_type = args.load
         LBRunner.percent_change = args.percentChange
         LBRunner.logfile = args.logfile
+        LBRunner.zipf_values = []
+        if args.zipfTrace is not None:
+            print(f"Reading Zipf values from {args.zipfTrace}")
+            with open(args.zipfTrace, "r") as f:
+                for line in f:
+                    LBRunner.zipf_values.append(float(line.strip()))
+            print(f"Found {len(LBRunner.zipf_values)} Zipf values")
+            assert len(LBRunner.zipf_values) >= LBRunner.num_rounds, f"Expected {LBRunner.num_rounds} Zipf values, found {len(LBRunner.zipf_values)} in {args.zipfTrace}"
         benchmark = args.benchmark
 
         if benchmark == "base":
@@ -71,12 +81,17 @@ class LBRunner:
         random_gen = other_params['random_gen']
         new_loads = [0] * LBRunner.num_shards
         max_zipf_value = 0.75
-        if LBRunner.load_type == "stateless" or len(previous_loads) == 0:
+        # stateless, generate random within Python
+        if LBRunner.load_type == "trace":
+            assert 'round_num' in other_params, "Expected round number in other_params"
+            round_num = other_params['round_num']
+            zipf_value = LBRunner.zipf_values[round_num]
+        elif LBRunner.load_type == "stateless" or len(previous_loads) == 0:
             zipf_value = 0.25 + random_gen.random() * 0.5
-            for shard_num in range(LBRunner.num_shards):
-                load_val = int(round(load_scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
-                new_loads[shard_num] = load_val
+        # stateful, generate based on previous value within Python
         else:
+            assert LBRunner.load_type == "stateful", f"Expected stateful load type = stateful, found {LBRunner.load_type}"
+            assert 'prev_zipf_value' in other_params, "Expected previous zipf value in other_params"
             previous_zipf_value = other_params['prev_zipf_value']
             perc_change = LBRunner.percent_change
             random_val = random_gen.random()
@@ -88,10 +103,13 @@ class LBRunner:
             zipf_value = previous_zipf_value + current_change
             zipf_value = min(max_zipf_value, zipf_value)
             print(f"Zipf value: {previous_zipf_value:.3f} + {current_change:.3f} --> {zipf_value:.3f}")
-            for shard_num in range(LBRunner.num_shards):
-                load_val = int(round(load_scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
-                new_loads[shard_num] = load_val
+        # stateless, pick next value in zipf value list from a given trace
+        
+        for shard_num in range(LBRunner.num_shards):
+            load_val = int(round(load_scale_factor * (1.0 / ((shard_num+1)**zipf_value))))
+            new_loads[shard_num] = load_val
         return new_loads, zipf_value
+    
     @staticmethod
     def process_load_distribution(return_r, shard_loads, current_locations):
         new_locations = copy.deepcopy(current_locations)
@@ -141,7 +159,7 @@ class LBRunner:
         previous_loads = []
         prev_zipf_value = None
         for round_num in range(LBRunner.num_rounds):
-            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value, "round_num": round_num})
             previous_loads, prev_zipf_value = shard_loads, zipf_value
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
@@ -224,7 +242,8 @@ class LBRunner:
         previous_loads = []
         prev_zipf_value = None
         for round_num in range(LBRunner.num_rounds):
-            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, 
+            "prev_zipf_value": prev_zipf_value, "round_num": round_num})
             previous_loads, prev_zipf_value = shard_loads, zipf_value
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
@@ -308,7 +327,7 @@ class LBRunner:
         previous_loads = []
         prev_zipf_value = None
         for round_num in range(LBRunner.num_rounds):
-            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value, "round_num": round_num})
             previous_loads, prev_zipf_value = shard_loads, zipf_value
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
@@ -389,7 +408,7 @@ class LBRunner:
         prev_zipf_value = None
 
         for round_num in range(LBRunner.num_rounds):
-            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value, "round_num": round_num})
             previous_loads, prev_zipf_value = shard_loads, zipf_value
             # shard_loads = [0]*LBRunner.num_shards
             memory_usages = [1]*LBRunner.num_shards
@@ -453,7 +472,7 @@ class LBRunner:
         previous_loads = []
         prev_zipf_value = None
         for round_num in range(LBRunner.num_rounds):
-            gen_shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value})
+            gen_shard_loads, zipf_value = LBRunner.load_generator(previous_loads, LBRunner.scale_factor, {"random_gen": r, "prev_zipf_value": prev_zipf_value, "round_num": round_num})
             previous_loads, prev_zipf_value = gen_shard_loads, zipf_value
             total_load = sum(gen_shard_loads)
             # shard_loads = [0]*LBRunner.num_shards

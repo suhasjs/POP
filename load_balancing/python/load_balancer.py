@@ -11,7 +11,7 @@ except ImportError:
     pass
 
 class LoadBalancer:
-    verbose = False
+    verbose = True
     min_replication_factor = 1
     epsilonRatio = 20
     solver = cp.CPLEX
