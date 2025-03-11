@@ -201,7 +201,7 @@ def balance_load_alcd(num_shards, num_servers, shard_loads, shard_memory_usages,
     lpcfg.solve_from_dual = False
     # TODO (suhasjs) --> Why does reducing eta help us here??
     lpcfg.eta = 1e-1
-    lpcfg.verbose = True
+    lpcfg.verbose = False
     lpcfg.tol_trans = 5e-2
     lpcfg.tol = 5e-2
     # lpcfg.tol_sub = args.alcd_tol

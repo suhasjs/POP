@@ -11,7 +11,7 @@ except ImportError:
     pass
 
 class LoadBalancer:
-    verbose = True
+    verbose = False
     min_replication_factor = 1
     epsilonRatio = 20
     solver = cp.CPLEX
@@ -35,7 +35,7 @@ class LoadBalancer:
                                                      sample_queries, max_memory, split_factor)
         elif not relax:
             self.iter_num += 1
-            if self.iter_num > 20:
+            if self.iter_num > 0:
                 return self._balance_load_core_array(num_shards, num_servers, shard_loads, 
                                                     shard_memory_usages, current_locations, 
                                                     sample_queries, max_memory)
@@ -279,7 +279,7 @@ class LoadBalancer:
                                                                                     'dual_feasibility_tolerance': 5e-2, 
                                                                                     'primal_feasibility_tolerance': 5e-2})
         elif LoadBalancer.solver == cp.CPLEX:
-            cplex_params={"mip.tolerances.mipgap": 1, "emphasis.mip": 0, "mip.strategy.search": 2, "preprocessing.presolve": 0, "parallel": -1, "threads": 1, "mip.tolerances.integrality": 5e-2}
+            cplex_params={"mip.tolerances.mipgap": 0.05, "emphasis.mip": 0, "mip.strategy.search": 2, "preprocessing.presolve": 1, "parallel": -1, "threads": 8, "mip.tolerances.integrality": 1e-2}
             prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose, cplex_params=cplex_params, reoptimize=True)
         else:
             prob2.solve(solver=LoadBalancer.solver, verbose=LoadBalancer.verbose)
@@ -694,14 +694,18 @@ class LoadBalancer:
         for i in range(num_servers):
             xvars.append([1 if rvars[i][j] > 0 else 0 for j in range(num_shards)])
             memory_usages[i] = sum([xvars[i][j] * shard_memory_usages[j] for j in range(num_shards)])
+        print(f"Memory usages: {memory_usages}")
         violated_servers = [i for i in range(num_servers) if memory_usages[i] > max_memory]
         violated_servers = sorted(violated_servers, key=lambda i: memory_usages[i], reverse=True)
         # fix memory violations
         for server_id in violated_servers:
-            # print(f"Memory violation: {server_id}, allocated: {memory_usages[server_id]} > {max_memory}")
             # sort shards assigned to the server by load in increasing order of load
             sorted_shards = sorted(list(range(num_shards)), key=lambda j: rvars[server_id][j]*shard_loads[j])
+            removed_shards = []
             for shard_id in sorted_shards:
+                # skip if shard is not allocated
+                if rvars[server_id][shard_id] == 0:
+                    continue
                 # check if memory violation is fixed
                 if memory_usages[server_id] <= max_memory:
                     break
@@ -720,6 +724,14 @@ class LoadBalancer:
                         added_load = (rvars[i][shard_id] / (1 - removed_load)) * removed_load
                         rvars[i][shard_id] += added_load
                 memory_usages[server_id] -= shard_memory_usages[shard_id]
+                removed_shards.append(shard_id)
+        memory_usages = [0] * num_servers
+        new_xvars = []
+        for i in range(num_servers):
+            new_xvars.append([1 if rvars[i][j] > 0 else 0 for j in range(num_shards)])
+            memory_usages[i] = sum([new_xvars[i][j] * shard_memory_usages[j] for j in range(num_shards)])
+            # assert memory_usages[server_id] <= max_memory, f"Memory violation not fixed for server {server_id}, usage: {memory_usages[server_id]} > {max_memory}"
+        print(f"New memory usages: {memory_usages}")
         return rvars
 
     @staticmethod

@@ -329,6 +329,8 @@ class LBRunner:
             current_locations, load_imbalance, shards_moved, num_replicas = new_stats
             sorted_num_replicas = sorted(num_replicas, reverse=True)
             print(f"Top #replicas: {sorted_num_replicas[:10]}")
+            print(f"Bottom #replicas: {sorted_num_replicas[-10:]}")
+
             # last_locations = copy.deepcopy(current_locations)
             # shards_moved = 0
             # server_loads = []
