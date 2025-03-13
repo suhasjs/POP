@@ -26,6 +26,11 @@ public class LoadBalancerExecutable {
     static int numRounds = 100;
     static int skipRounds = 20;
     static long randomSeed = 42;
+    // stateful: random 10% change in zipf value each round
+    static double[] statefulZipfValues = new double[]{0.672,0.739,0.665,0.599,0.659,0.593,0.652,0.587,0.528,0.581,0.639,0.703,0.633,0.696,0.750,0.675,0.743,0.750,0.750,0.750,0.675,0.743,0.750,0.750,0.675,0.608,0.547,0.601,0.662,0.728,0.655,0.720,0.648,0.713,0.750,0.675,0.743,0.668,0.735,0.750,0.675,0.608,0.668,0.601,0.541,0.595,0.536,0.589,0.531,0.584,0.642,0.578,0.520,0.468,0.515,0.566,0.510,0.561,0.617,0.678,0.746,0.750,0.750,0.750,0.750,0.675,0.743,0.668,0.735,0.662,0.595,0.536,0.589,0.648,0.584,0.525,0.578,0.635,0.699,0.750,0.750,0.750,0.750,0.675,0.743,0.668,0.735,0.750,0.750,0.750,0.750,0.750,0.675,0.743,0.750,0.750,0.750,0.675,0.743,0.668};
+    // random: 0.25 + random_value * 0.5 where random_value is random between 0 and 1
+    static double[] randomZipfValues = new double[]{0.614,0.592,0.404,0.389,0.583,0.702,0.434,0.388,0.482,0.641,0.710,0.468,0.625,0.443,0.339,0.547,0.355,0.663,0.336,0.544,0.626,0.536,0.540,0.626,0.266,0.429,0.659,0.459,0.737,0.607,0.490,0.396,0.725,0.660,0.568,0.435,0.430,0.467,0.479,0.486,0.485,0.664,0.326,0.667,0.480,0.390,0.348,0.340,0.683,0.493,0.460,0.566,0.600,0.408,0.536,0.436,0.686,0.653,0.558,0.437,0.599,0.704,0.348,0.655,0.564,0.482,0.403,0.520,0.568,0.313,0.499,0.264,0.268,0.492,0.578,0.448,0.720,0.442,0.573,0.635,0.697,0.549,0.738,0.289,0.638,0.389,0.700,0.437,0.466,0.416,0.408,0.471,0.298,0.623,0.335,0.653,0.320,0.296,0.264,0.524};
+
 
     public static void main(String[] args) throws Exception {
         Options options = new Options();
@@ -33,6 +38,7 @@ public class LoadBalancerExecutable {
         options.addOption("numServers", true, "Number of Servers?");
         options.addOption("numSplits", true, "Split Factor?");
         options.addOption("benchmark", true, "Which Benchmark?");
+        options.addOption("stateful", true, "Whether to use stateful zipf values");
 
         CommandLineParser parser = new DefaultParser();
         CommandLine cmd = parser.parse(options, args);
@@ -41,18 +47,28 @@ public class LoadBalancerExecutable {
         numServers = Integer.parseInt(cmd.getOptionValue("numServers"));
         splitFactor = cmd.hasOption("numSplits") ? Integer.parseInt(cmd.getOptionValue("numSplits")) : 1;
         String benchmark = cmd.getOptionValue("benchmark");
+        boolean useStateful = cmd.hasOption("stateful");
+
+        // double[] randomZipfValues = new double[numRounds];
+        // Random r = new Random();
+        // r.setSeed(randomSeed);
+        // for (int roundNum = 0; roundNum < numRounds; roundNum++) {
+        //     double zipfValue = 0.25 + r.nextDouble() * 0.5;
+        //     randomZipfValues[roundNum] = zipfValue;
+        // }
+        double[] chosenZipfValues = useStateful ? statefulZipfValues : randomZipfValues;
 
         if (benchmark.equals("base")) {
-            zipfianBenchmark();
+            zipfianBenchmark(chosenZipfValues);
         } else if (benchmark.equals("split")) {
-            zipfianBenchmarkSplit();
+            zipfianBenchmarkSplit(chosenZipfValues);
         } else if (benchmark.equals("heuristic")) {
-            zipfianHeuristicBenchmark();
+            zipfianHeuristicBenchmark(chosenZipfValues);
         }
 
     }
 
-    public static void zipfianBenchmark() throws IloException {
+    public static void zipfianBenchmark(double[] zipfValues) throws IloException {
         logger.info("zipfianBenchmark");
 
         LoadBalancer.verbose = true;
@@ -66,7 +82,8 @@ public class LoadBalancerExecutable {
         Random r = new Random();
         r.setSeed(randomSeed);
         for (int roundNum = 0; roundNum < numRounds; roundNum++) {
-            double zipfValue = 0.25 + r.nextDouble() * 0.5;
+            // double zipfValue = 0.25 + r.nextDouble() * 0.5;
+            double zipfValue = zipfValues[roundNum];
             int[] shardLoads = new int[numShards];
             int[] memoryUsages = new int[numShards];
             for (int shardNum = 0; shardNum < numShards; shardNum++) {
@@ -111,7 +128,7 @@ public class LoadBalancerExecutable {
         System.out.printf("Average movements: %.2f, Average time: %dms\n", (double) totalMovements / (numRounds - skipRounds), totalTime / (numRounds - skipRounds));
     }
 
-    public static void zipfianBenchmarkSplit() throws IloException {
+    public static void zipfianBenchmarkSplit(double[] zipfValues) throws IloException {
         logger.info("zipfianBenchmarkSplit");
         LoadBalancer.verbose = false;
         int[][] currentLocations = new int[numServers][numShards];
@@ -122,7 +139,8 @@ public class LoadBalancerExecutable {
         Random r = new Random();
         r.setSeed(randomSeed);
         for (int roundNum = 0; roundNum < numRounds; roundNum++) {
-            double zipfValue = 0.25 + r.nextDouble() * 0.5;
+            // double zipfValue = 0.25 + r.nextDouble() * 0.5;
+            double zipfValue = zipfValues[roundNum];
             int[] shardLoads = new int[numShards];
             int[] memoryUsages = new int[numShards];
             for (int shardNum = 0; shardNum < numShards; shardNum++) {
@@ -162,7 +180,7 @@ public class LoadBalancerExecutable {
         System.out.printf("Split Average movements: %.2f, Average time: %dms\n", (double) totalMovements / (numRounds - skipRounds), totalTime / (numRounds - skipRounds));
     }
 
-    public static void zipfianHeuristicBenchmark() {
+    public static void zipfianHeuristicBenchmark(double[] zipfValues) {
         logger.info("zipfianHeuristicBenchmark");
 
         LoadBalancer.verbose = false;
@@ -179,7 +197,8 @@ public class LoadBalancerExecutable {
         Random r = new Random();
         r.setSeed(randomSeed);
         for (int roundNum = 0; roundNum < numRounds; roundNum++) {
-            double zipfValue = 0.25 + r.nextDouble() * 0.5;
+            // double zipfValue = 0.25 + r.nextDouble() * 0.5;
+            double zipfValue = zipfValues[roundNum];
             Map<Integer, Integer> shardLoads = new HashMap<>();
             int totalLoad = 0;
             for (int shardNum = 0; shardNum < numShards; shardNum++) {
