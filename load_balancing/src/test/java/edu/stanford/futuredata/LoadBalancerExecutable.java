@@ -68,6 +68,21 @@ public class LoadBalancerExecutable {
 
     }
 
+    public static double getImbalance(List<double[]> rVars, int[] shardLoads) {
+        double averageLoad = IntStream.of(shardLoads).sum() / (double) numServers;
+        double maxLoad = 0;
+        double minLoad = Double.MAX_VALUE;
+        for (double[] Rs: rVars) {
+            double serverLoad = 0;
+            for (int i = 0; i < numShards; i++) {
+                serverLoad += Rs[i] * shardLoads[i];
+            }
+            maxLoad = Math.max(maxLoad, serverLoad);
+            minLoad = Math.min(minLoad, serverLoad);
+        }
+        return 100 * (maxLoad  - minLoad) / averageLoad;
+    }
+
     public static void zipfianBenchmark(double[] zipfValues) throws IloException {
         logger.info("zipfianBenchmark");
 
@@ -79,6 +94,7 @@ public class LoadBalancerExecutable {
         }
         long totalTime = 0;
         int totalMovements = 0;
+        double totalImbalance = 0;
         Random r = new Random();
         r.setSeed(randomSeed);
         for (int roundNum = 0; roundNum < numRounds; roundNum++) {
@@ -119,13 +135,15 @@ public class LoadBalancerExecutable {
                     }
                 }
             }
+            double imbalance = getImbalance(returnR, shardLoads);
             if (roundNum >= skipRounds) {
                 totalMovements += shardsMoved;
                 totalTime += lbTime;
+                totalImbalance += imbalance;
             }
-            System.out.printf("Round: %d Zipf: %.3f Shards Moved: %d LB time: %dms\n", roundNum, zipfValue, shardsMoved, lbTime);
+            System.out.printf("Round: %d Zipf: %.3f Shards Moved: %d LB time: %dms Load Imbalance: %.2f%%\n", roundNum, zipfValue, shardsMoved, lbTime, imbalance);
         }
-        System.out.printf("Average movements: %.2f, Average time: %dms\n", (double) totalMovements / (numRounds - skipRounds), totalTime / (numRounds - skipRounds));
+        System.out.printf("Average movements: %.2f, Average time: %dms Average load imbalance: %.2f%%\n", (double) totalMovements / (numRounds - skipRounds), totalTime / (numRounds - skipRounds), (double) totalImbalance / (numRounds - skipRounds));
     }
 
     public static void zipfianBenchmarkSplit(double[] zipfValues) throws IloException {
@@ -134,6 +152,7 @@ public class LoadBalancerExecutable {
         int[][] currentLocations = new int[numServers][numShards];
         long totalTime = 0;
         int totalMovements = 0;
+        double totalImbalance = 0;
         List<Integer> order = IntStream.range(0, numShards).boxed().collect(Collectors.toList());
         Collections.shuffle(order);
         Random r = new Random();
@@ -171,13 +190,15 @@ public class LoadBalancerExecutable {
                     }
                 }
             }
+            double imbalance = getImbalance(returnR, shardLoads);
             if (roundNum >= skipRounds) {
                 totalMovements += shardsMoved;
                 totalTime += lbTime;
+                totalImbalance += imbalance;
             }
-            System.out.printf("Round: %d Zipf: %.3f Shards Moved: %d LB time: %dms\n", roundNum, zipfValue, shardsMoved, lbTime);
+            System.out.printf("Round: %d Zipf: %.3f Shards Moved: %d LB time: %dms Load Imbalance: %.2f%%\n", roundNum, zipfValue, shardsMoved, lbTime, imbalance);
         }
-        System.out.printf("Split Average movements: %.2f, Average time: %dms\n", (double) totalMovements / (numRounds - skipRounds), totalTime / (numRounds - skipRounds));
+        System.out.printf("Split Average movements: %.2f, Average time: %dms, Average load imbalance: %.2f%%\n", (double) totalMovements / (numRounds - skipRounds), totalTime / (numRounds - skipRounds), (double) totalImbalance / (numRounds - skipRounds));
     }
 
     public static void zipfianHeuristicBenchmark(double[] zipfValues) {
@@ -194,6 +215,7 @@ public class LoadBalancerExecutable {
         }
         long totalTime = 0;
         int totalMovements = 0;
+        double totalImbalance = 0;
         Random r = new Random();
         r.setSeed(randomSeed);
         for (int roundNum = 0; roundNum < numRounds; roundNum++) {
@@ -214,18 +236,21 @@ public class LoadBalancerExecutable {
             assertEquals(numShards, currentLocations.size());
             double averageLoad = totalLoad / (double) numServers;
 
-            // Check correctness.
-            if (LoadBalancer.verbose) {
-                for (int serverNum = 0; serverNum < numServers; serverNum++) {
-                    double serverLoad = 0;
-                    for (int shardNum = 0; shardNum < numShards; shardNum++) {
-                        if (currentLocations.get(shardNum) == serverNum) {
-                            serverLoad += shardLoads.get(shardNum);
-                        }
+            // Compute per-server load, find min and max
+            double maxLoad = 0;
+            double minLoad = Double.MAX_VALUE;
+            for (int serverNum = 0; serverNum < numServers; serverNum++) {
+                double serverLoad = 0;
+                for (int shardNum = 0; shardNum < numShards; shardNum++) {
+                    if (currentLocations.get(shardNum) == serverNum) {
+                        serverLoad += shardLoads.get(shardNum);
                     }
-                    logger.info("{} {} {}", serverNum, averageLoad, serverLoad);
                 }
+                // logger.info("{} {} {}", serverNum, averageLoad, serverLoad);
+                maxLoad = Math.max(maxLoad, serverLoad);
+                minLoad = Math.min(minLoad, serverLoad);
             }
+            double imbalance = 100 * (maxLoad - minLoad) / averageLoad;
 
             int shardsMoved = 0;
             for(int shardNum = 0; shardNum < numShards; shardNum++) {
@@ -236,9 +261,10 @@ public class LoadBalancerExecutable {
             if (roundNum >= skipRounds) {
                 totalMovements += shardsMoved;
                 totalTime += lbTime;
+                totalImbalance += imbalance;
             }
-            System.out.printf("Round: %d Zipf: %.3f Shards Moved: %d LB time: %dms\n", roundNum, zipfValue, shardsMoved, lbTime);
+            System.out.printf("Round: %d Zipf: %.3f Shards Moved: %d LB time: %dms Load Imbalance: %.2f%%\n", roundNum, zipfValue, shardsMoved, lbTime, imbalance);
         }
-        System.out.printf("Average movements: %.2f, Average time: %dms\n", (double) totalMovements / (numRounds - skipRounds), totalTime / (numRounds - skipRounds));
+        System.out.printf("Average movements: %.2f, Average time: %dms, Average load imbalance: %.2f%%\n", (double) totalMovements / (numRounds - skipRounds), totalTime / (numRounds - skipRounds), (double) totalImbalance / (numRounds - skipRounds));
     }
 }
